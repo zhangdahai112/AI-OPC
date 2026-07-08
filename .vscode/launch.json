@@ -1,0 +1,106 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    /* ─── 后端：FastAPI + uvicorn ─── */
+    {
+      "name": "后端 FastAPI (debug)",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "uvicorn",
+      "args": [
+        "app.main:app",
+        "--app-dir", "${workspaceFolder}/backend",
+        "--host", "127.0.0.1",
+        "--port", "8777",
+        "--reload"
+      ],
+      "jinja": true,
+      "env": {
+        "PYTHONIOENCODING": "utf-8",
+        "WARROOM_DATA": "${workspaceFolder}/data"
+      },
+      "python": "${workspaceFolder}/.venv/Scripts/python.exe",
+      "console": "integratedTerminal",
+      "presentation": {
+        "group": "warroom",
+        "order": 1
+      }
+    },
+
+    /* ─── 后端：FastAPI 启动（不带 reload，attach） ─── */
+    {
+      "name": "后端 FastAPI (attach)",
+      "type": "debugpy",
+      "request": "attach",
+      "connect": {
+        "host": "127.0.0.1",
+        "port": 5678
+      },
+      "pathMappings": [{
+        "localRoot": "${workspaceFolder}/backend",
+        "remoteRoot": "${workspaceFolder}/backend"
+      }],
+      "presentation": {
+        "group": "warroom",
+        "order": 2
+      }
+    },
+
+    /* ─── 前端：Vite 开发服务器 ─── */
+    {
+      "name": "前端 React (Vite)",
+      "type": "node-terminal",
+      "request": "launch",
+      "command": "npm run dev",
+      "cwd": "${workspaceFolder}/frontend",
+      "serverReadyAction": {
+        "action": "openExternally",
+        "pattern": "http://localhost:5173",
+        "uriFormat": "http://localhost:5173"
+      },
+      "presentation": {
+        "group": "warroom",
+        "order": 3
+      }
+    },
+
+    /* ─── 前端：已存在的 Vite 服务器上打开浏览器 ─── */
+    {
+      "name": "前端 打开浏览器",
+      "type": "chrome",
+      "request": "launch",
+      "url": "http://localhost:5173",
+      "webRoot": "${workspaceFolder}/frontend/src",
+      "sourceMapPathOverrides": {
+        "/__vite/*": "${workspaceFolder}/frontend/*"
+      },
+      "preLaunchTask": null,
+      "presentation": {
+        "group": "warroom",
+        "order": 4
+      }
+    }
+  ],
+
+  /* ─── 组合启动：一键 Debug 前后端 ─── */
+  "compounds": [
+    {
+      "name": "全部启动 (后端 + 前端)",
+      "configurations": ["后端 FastAPI (debug)", "前端 React (Vite)"],
+      "stopAll": true,
+      "presentation": {
+        "order": 0,
+        "group": "warroom"
+      }
+    },
+    {
+      "name": "仅后端 + 打开浏览器",
+      "configurations": ["后端 FastAPI (debug)", "前端 打开浏览器"],
+      "stopAll": true,
+      "presentation": {
+        "order": 5,
+        "group": "warroom"
+      }
+    }
+  ]
+}

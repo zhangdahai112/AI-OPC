@@ -1,0 +1,15 @@
+.venv/
+.env
+__pycache__/
+*.pyc
+data/*.db
+data/*.db-*
+data/*.log
+data/*.json
+data/memory/
+workspaces/
+.DS_Store
+node_modules/
+# local / build caches
+.claude/settings.local.json
+*.tsbuildinfo
