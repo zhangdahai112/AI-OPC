@@ -8,27 +8,74 @@ from __future__ import annotations
 
 import asyncio
 
-from . import channels, db, events, llm, projects, tools
+from . import agents, channels, db, events, llm, mcp, projects, skill_store, tools
 from .engine import ROLE_CN, get_ticket, post as engine_post, _set_roster_state
 
 ROLE_KEYS = list(ROLE_CN.keys())
 
 
+def _harness_text(tools_enabled: set[str]) -> str:
+    """The tool-use instructions, restricted to the tools this agent actually
+    holds (least privilege). A read-only agent is told so explicitly rather than
+    being handed write/run instructions it can't execute."""
+    lines = ["\n【你有真实工具，必须实际使用，不要凭空臆测代码】"]
+    if tools_enabled & {"list_dir", "read_file", "grep"}:
+        lines.append("- list_dir / read_file / grep：查看真实仓库结构与文件内容；"
+                     "回答涉及代码前，先用它们核实，不要编造文件名或实现。")
+    if "write_file" in tools_enabled:
+        lines.append("- write_file：按你的职责真正修改/新增文件。")
+    if "run_command" in tools_enabled:
+        lines.append("- run_command：在仓库目录跑命令（测试 pytest/npm test、"
+                     "git status/diff/add/commit、构建等）。")
+    if tools_enabled & {"write_file", "run_command"}:
+        lines.append("先调研（读/搜），再动手（写/跑），最后用 git diff/status 自查并简述"
+                     "你改了什么、验证结果如何。涉及上线/删除/改库等不可逆动作时先说明并"
+                     "请求人类确认，不要擅自执行。")
+    else:
+        lines.append("你当前是只读权限：只做调研与建议，不直接改仓库；"
+                     "需要改动时用「@角色key」点名有写权限的成员来执行。")
+    return "\n".join(lines)
+
+
 # ---- system prompt assembly --------------------------------------------
-def assemble_system(cid_or_tid: str, role: str, *, is_channel: bool = False) -> str:
+def assemble_system(cid_or_tid: str, role: str, manifest: dict,
+                    *, is_channel: bool = False) -> str:
+    """Build the agent's system prompt from its resolved manifest.
+
+    Ordered cold→hot for prompt-cache stability: stable identity / guardrails /
+    harness first, then the semi-stable project grounding and member list.
+    """
     if is_channel:
         ch = channels.get_channel(cid_or_tid)
         project_ids = [p["project_id"] for p in ch.get("projects", []) if p.get("project_id")]
         name = ch.get("name", "群聊")
+        members = ch.get("members", [])
     else:
         t = get_ticket(cid_or_tid)
         project_ids = [t.get("project_id")] if t.get("project_id") else []
         name = t.get("title", "工单")
+        members = t.get("roster", [])
 
+    ident = manifest.get("identity", {})
     parts: list[str] = []
     parts.append(
-        f"你是一名 AI {ROLE_CN.get(role, role)}（角色 key: {role}），"
+        f"你是一名 AI {ident.get('name', ROLE_CN.get(role, role))}（角色 key: {role}），"
         f"在一个多 agent 协作「群聊」里与人类操作员和其他 agent 一起工作。当前群：{name}。")
+    if ident.get("focus"):
+        parts.append(f"你的职责聚焦：{ident['focus']}。")
+
+    guardrails = manifest.get("prompt", {}).get("guardrails") or []
+    if guardrails:
+        parts.append("\n【你的质量红线】\n" + "\n".join(f"- {g}" for g in guardrails))
+
+    tools_enabled = set(manifest.get("harness", {}).get("builtinTools", []))
+    if project_ids and tools_enabled:
+        parts.append(_harness_text(tools_enabled))
+
+    # progressive-disclosure index of installed skills (name + when_to_use)
+    skill_index = skill_store.system_index(manifest.get("skills", []) or [])
+    if skill_index:
+        parts.append(f"\n【可用技能】\n{skill_index}")
 
     for pid in project_ids:
         proj = projects.get_project(pid) if pid else None
@@ -43,26 +90,11 @@ def assemble_system(cid_or_tid: str, role: str, *, is_channel: bool = False) -> 
             if ctx:
                 parts.append(f"\n【代码库上下文】\n{ctx}")
 
-    # load members
-    if is_channel:
-        members = ch.get("members", [])
-    else:
-        members = t.get("roster", [])
     others = [(r["role"], ROLE_CN.get(r["role"], r["role"]))
               for r in members if r.get("role") != role]
     if others:
         listing = "、".join(f"{cn}（@{key}）" for key, cn in others)
         parts.append(f"\n群里的其他成员：{listing}。")
-
-    if project_ids:
-        parts.append(
-            "\n【你有真实工具，必须实际使用，不要凭空臆测代码】"
-            "\n- list_dir / read_file / grep：查看真实仓库结构与文件内容；"
-            "回答涉及代码前，先用它们核实，不要编造文件名或实现。"
-            "\n- write_file：按你的职责真正修改/新增文件。"
-            "\n- run_command：在仓库目录跑命令（测试 pytest/npm test、git status/diff/add/commit、构建等）。"
-            "\n先调研（读/搜），再动手（写/跑），最后用 git diff/status 自查并简述你改了什么、验证结果如何。"
-            "涉及上线/删除/改库等不可逆动作时先说明并请求人类确认，不要擅自执行。")
 
     parts.append(
         "\n协作规则：只做你这个角色该做的事。遇到不属于你职责的问题，"
@@ -194,7 +226,11 @@ async def agent_reply(cid_or_tid: str, role: str, *, is_channel: bool = False) -
                 payload={"kind": "agent", "html": "", "message_id": mid,
                          "streaming": True})
 
-    system = assemble_system(cid_or_tid, role, is_channel=is_channel)
+    project_ids = _project_ids(cid_or_tid, is_channel=is_channel)
+    primary_pid = project_ids[0] if project_ids else None
+    manifest = agents.resolve(primary_pid, role)
+
+    system = assemble_system(cid_or_tid, role, manifest, is_channel=is_channel)
     msgs = [{"role": "user", "content":
              _transcript(cid_or_tid, is_channel=is_channel) +
              f"\n\n请以「{ROLE_CN[role]}」身份回复最新消息。"}]
@@ -205,20 +241,29 @@ async def agent_reply(cid_or_tid: str, role: str, *, is_channel: bool = False) -
         acc.append(text)
         events.emit_delta(cid_or_tid, role, str(mid), text)
 
-    # real tools — only when the channel/ticket actually has a checked-out repo
-    ctx = tools.ToolContext.for_projects(_project_ids(cid_or_tid, is_channel=is_channel))
+    # real tools — built-in repo tools (only with a checked-out repo, least
+    # privilege per manifest) plus any MCP-mounted tools from the manifest.
+    ctx = tools.ToolContext.for_projects(project_ids)
+    mcp_mounts = manifest.get("mcp", []) or []
+    mcp_specs = mcp.tool_specs(mcp_mounts)
+
+    builtin_specs = tools.tool_specs(allow=agents.allowed_tools(manifest)) if ctx.has_repo else None
+    tool_specs = (builtin_specs or []) + mcp_specs
+
     tool_calls: list[dict] = []
     on_tool = None
-    tool_specs = None
-    if ctx.has_repo:
-        tool_specs = tools.tool_specs()
-
+    if tool_specs:
         async def on_tool(name: str, args: dict, _uid: str) -> str:
-            label = tools.summarize(name, args)
+            is_mcp = mcp.is_mcp_tool(name)
+            label = name if is_mcp else tools.summarize(name, args)
             events.emit("tool_call", ticket=cid_or_tid, agent=role,
                         payload={"message_id": mid, "tool": name, "text": label})
-            # tools are blocking (subprocess/fs) — run off the event loop
-            result = await asyncio.to_thread(tools.execute, name, args, ctx)
+            if is_mcp:
+                # MCP calls are async (network/subprocess JSON-RPC), never raise
+                result = await mcp.execute(name, args, mcp_mounts)
+            else:
+                # built-in tools are blocking (subprocess/fs) — run off the loop
+                result = await asyncio.to_thread(tools.execute, name, args, ctx)
             rec = {"tool": name, "text": label, "result": result[:1500]}
             tool_calls.append(rec)
             # persist incrementally so a long turn survives a reload
@@ -232,7 +277,7 @@ async def agent_reply(cid_or_tid: str, role: str, *, is_channel: bool = False) -
             return result
 
     res = await llm.stream_reply(system, msgs, on_delta,
-                                 tools=tool_specs, on_tool=on_tool)
+                                 tools=(tool_specs or None), on_tool=on_tool)
     full = res.get("text") or "".join(acc)
 
     payload = {"kind": "agent", "html": full, "message_id": mid}

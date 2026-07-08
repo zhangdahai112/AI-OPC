@@ -2,14 +2,16 @@ import { type ReactNode } from "react";
 import { useAppState } from "../context";
 import ChannelRail from "./ChannelRail";
 import ContextPanel from "./ContextPanel";
+import Icon, { type IconName } from "./ui/Icon";
 
-type View = "channels" | "projects" | "metrics" | "config";
+type View = "channels" | "projects" | "metrics" | "config" | "market";
 
-const TABS: [View, string, string][] = [
-  ["channels", "群聊", "💬"],
-  ["projects", "项目", "📁"],
-  ["metrics", "指标", "📊"],
-  ["config", "配置", "⚙"],
+const TABS: [View, string, IconName][] = [
+  ["channels", "群聊", "chat"],
+  ["projects", "项目", "folder"],
+  ["market", "市场", "store"],
+  ["metrics", "指标", "chart"],
+  ["config", "配置", "settings"],
 ];
 
 export default function Layout({ center }: { center: ReactNode }) {
@@ -30,8 +32,10 @@ export default function Layout({ center }: { center: ReactNode }) {
       {/* Left rail */}
       <aside className="rail">
         <div className="brand">
-          <div className="logo">群</div>
-          <b>作战群</b>
+          <div className="logo">
+            <Icon name="node" size={17} />
+          </div>
+          <b>AI-OPC</b>
           <span className="wsdot" title={wsTitle} />
           {activeProvider && (
             <span
@@ -51,8 +55,8 @@ export default function Layout({ center }: { center: ReactNode }) {
               className={`tab${view === key ? " on" : ""}`}
               onClick={() => setView(key)}
             >
-              <span className="ic">{icon}</span>
-              {label}
+              <span className="ic"><Icon name={icon} size={18} /></span>
+              <span className="lbl">{label}</span>
             </button>
           ))}
         </div>
@@ -61,6 +65,7 @@ export default function Layout({ center }: { center: ReactNode }) {
         <div className="railscroll">
           {view === "channels" && <ChannelRail />}
           {view === "projects" && <ProjectsRail />}
+          {view === "market" && <MarketRail />}
           {view === "metrics" && <MetricsRail />}
           {view === "config" && <ConfigRail />}
         </div>
@@ -96,7 +101,7 @@ function ProjectsRail() {
             className={`item${activeProject?.id === p.id ? " on" : ""}`}
             onClick={() => setActiveProject(p)}
           >
-            <span className="ic">📁</span>
+            <span className="ic"><Icon name="folder" size={15} /></span>
             {p.name}
             <span className="pill" style={{ marginLeft: "auto" }}>{p.status}</span>
           </div>
@@ -106,26 +111,48 @@ function ProjectsRail() {
   );
 }
 
+function MarketRail() {
+  const cats: [string, string][] = [
+    ["mcp", "MCP 连接器"],
+    ["skills", "Skills 技能"],
+  ];
+  return (
+    <div className="cfgnav">
+      <div className="grouphd">市场</div>
+      {cats.map(([key, label]) => (
+        <div
+          key={key}
+          className="item"
+          onClick={() => document.dispatchEvent(new CustomEvent("set-market-tab", { detail: key }))}
+        >
+          <span className="ic"><Icon name={key === "mcp" ? "plug" : "layers"} size={16} /></span>
+          {label}
+        </div>
+      ))}
+    </div>
+  );
+}
+
 function MetricsRail() {
   return (
     <div className="cfgnav">
       <div className="item on">
-        <span className="ic">📊</span>平台自指标
+        <span className="ic"><Icon name="chart" size={15} /></span>平台自指标
       </div>
     </div>
   );
 }
 
 function ConfigRail() {
-  const sections: [string, string, string][] = [
-    ["agents", "团队成员", "👥"],
-    ["templates", "工单流程", "🗂"],
-    ["gates", "验收门", "✓"],
-    ["skills", "规约 / 技能", "📐"],
-    ["llm", "LLM 供应商", "🤖"],
-    ["repos", "仓库与凭证", "🔑"],
-    ["integrations", "集成", "🔌"],
-    ["budget", "审批与预算", "⚖"],
+  const sections: [string, string, IconName][] = [
+    ["agents", "团队成员", "users"],
+    ["templates", "工单流程", "layers"],
+    ["gates", "验收门", "check"],
+    ["skills", "规约 / 技能", "ruler"],
+    ["llm", "LLM 供应商", "cpu"],
+    ["repos", "仓库与凭证", "key"],
+    ["integrations", "集成", "plug"],
+    ["budget", "审批与预算", "scale"],
   ];
   return (
     <div className="cfgnav">
@@ -135,7 +162,7 @@ function ConfigRail() {
           className="item"
           onClick={() => document.dispatchEvent(new CustomEvent("set-cfg-section", { detail: key }))}
         >
-          <span className="ic">{icon}</span>
+          <span className="ic"><Icon name={icon} size={15} /></span>
           {label}
         </div>
       ))}

@@ -250,16 +250,33 @@ async def _anthropic_stream(
     text_parts: list[str] = []
     in_tok = out_tok = 0
     final = None
+
+    # ── prompt caching (KV cost optimization) ──────────────────────────────
+    # Cache the stable prefix — the tool schema and the system prompt — so a
+    # multi-turn conversation (and the tool-use loop within one turn, which
+    # replays the same system+tools every iteration) reads it at ~0.1x instead
+    # of paying full input price each time. Only worth a breakpoint when the
+    # block clears Anthropic's ~1024-token minimum, so we gate on length.
+    sys_param: Any = system
+    if isinstance(system, str) and len(system) >= 4000:
+        sys_param = [{"type": "text", "text": system,
+                      "cache_control": {"type": "ephemeral"}}]
+    cached_tools = tools
+    if use_tools and tools:
+        cached_tools = [dict(t) for t in tools]
+        cached_tools[-1] = {**cached_tools[-1],
+                            "cache_control": {"type": "ephemeral"}}
+
     try:
         for _ in range(MAX_TOOL_ITERS if use_tools else 1):
             kwargs: dict[str, Any] = {
                 "model": model,
                 "max_tokens": max_tok,
-                "system": system,
+                "system": sys_param,
                 "messages": convo,
             }
             if use_tools:
-                kwargs["tools"] = tools
+                kwargs["tools"] = cached_tools
             async with client.messages.stream(**kwargs) as stream:
                 async for text in stream.text_stream:
                     text_parts.append(text)

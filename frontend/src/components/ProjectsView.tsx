@@ -1,9 +1,9 @@
 import { useAppState } from "../context";
-import { ROLES } from "../constants";
 import { esc } from "../utils";
 import * as api from "../api";
 import { useState, useEffect } from "react";
 import SkillAssist from "./SkillAssist";
+import AgentStudio from "./AgentStudio";
 
 /** Set an uncontrolled textarea's value by id and fire a native input event so
  *  React-adjacent listeners (and the eventual save) see the change. */
@@ -77,7 +77,6 @@ function ProjectDetail({
 }) {
   const { toast } = useAppState();
   const p = project;
-  const mem = p.memory || {};
 
   const saveDoc = async () => {
     const textarea = document.getElementById(
@@ -88,19 +87,6 @@ function ProjectDetail({
       await api.updateProjectDocs(p.id, textarea.value);
       toast("需求文档已保存");
       onRefresh();
-    } catch {
-      toast("保存失败");
-    }
-  };
-
-  const saveMem = async (role: string) => {
-    const textarea = document.getElementById(
-      `mem-${role}`
-    ) as HTMLTextAreaElement;
-    if (!textarea) return;
-    try {
-      await api.setAgentMemory(p.id, role, textarea.value);
-      toast(`${(ROLES[role as keyof typeof ROLES] || { nm: role }).nm}记忆已保存`);
     } catch {
       toast("保存失败");
     }
@@ -164,49 +150,7 @@ function ProjectDetail({
         </div>
       </div>
 
-      <div className="seghd">各 agent 的永久记忆（按项目）</div>
-      {Object.keys(ROLES).map((role) => {
-        const info = ROLES[role as keyof typeof ROLES];
-        return (
-          <div key={role} className="secbox">
-            <div className="secrow">
-              <div className={`av-sm ${role}`}>{info.ab}</div>
-              <div style={{ flex: 1 }}>
-                <div className="ttl">{info.nm} · 永久记忆</div>
-                <div className="ds">
-                  注入该 agent 在本项目每次回答的系统提示词
-                </div>
-              </div>
-            </div>
-            <div style={{ padding: "0 18px 14px" }}>
-              <textarea
-                className="memta"
-                id={`mem-${role}`}
-                rows={5}
-                defaultValue={mem[role as keyof typeof mem] || ""}
-              />
-              <div className="actions">
-                <button
-                  className="btn primary"
-                  onClick={() => saveMem(role)}
-                >
-                  保存{info.nm}记忆
-                </button>
-                <SkillAssist
-                  target="memory"
-                  role={role}
-                  projectId={p.id}
-                  label="生成宪章"
-                  onApply={(t) => {
-                    fillTextarea(`mem-${role}`, t);
-                    saveMem(role);
-                  }}
-                />
-              </div>
-            </div>
-          </div>
-        );
-      })}
+      <AgentStudio key={p.id} projectId={p.id} />
     </>
   );
 }

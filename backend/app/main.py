@@ -13,7 +13,8 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from . import channels, chat, db, engine, events, llm, memory, projects, seed, skills
+from . import (agents, channels, chat, connections, db, engine, events, llm,
+               marketplace, memory, projects, seed, skill_store, skills)
 from .config import WEB_DIR
 
 app = FastAPI(title="Agent 作战群 · 控制台", version="0.1.0")
@@ -90,6 +91,11 @@ class SkillGenMsg(BaseModel):
     project_id: str = ""
     role: str = ""
     brief: str = ""
+
+
+class SkillInstallMsg(BaseModel):
+    id: str
+    source: str = ""
 
 
 # ---- tickets ------------------------------------------------------------
@@ -371,6 +377,34 @@ def api_set_memory(pid: str, body: AgentMemory):
     return projects.set_agent_memory(pid, body.role, body.text)
 
 
+# ---- per-project Agent Manifests (Agent Studio, phase 1) ----------------
+class AgentManifestPatch(BaseModel):
+    manifest: dict
+
+
+@app.get("/api/projects/{pid}/agents")
+def api_project_agents(pid: str):
+    """Resolved Agent Manifest for every role in this project."""
+    if not projects.get_project(pid):
+        raise HTTPException(404, "project not found")
+    return {"agents": agents.list_for_project(pid)}
+
+
+@app.get("/api/projects/{pid}/agents/{role}")
+def api_project_agent(pid: str, role: str):
+    if not projects.get_project(pid):
+        raise HTTPException(404, "project not found")
+    return agents.resolve(pid, role)
+
+
+@app.put("/api/projects/{pid}/agents/{role}")
+def api_set_project_agent(pid: str, role: str, body: AgentManifestPatch):
+    """Save a partial override for (project, role); returns the resolved manifest."""
+    if not projects.get_project(pid):
+        raise HTTPException(404, "project not found")
+    return agents.set_overrides(pid, role, body.manifest)
+
+
 # ---- channels (group chat) -----------------------------------------------
 
 class NewChannel(BaseModel):
@@ -529,6 +563,98 @@ async def api_skill_generate(body: SkillGenMsg):
         raise HTTPException(404, "unknown skill")
     return await skills.generate(skill_id=body.skill_id, project_id=body.project_id,
                                  role=body.role, brief=body.brief)
+
+
+# ---- connections (credentials for MCP / egress, key-free responses) -----
+@app.get("/api/connections")
+def api_connections():
+    """key-free status list — never exposes plaintext secrets."""
+    return {"connections": connections.list_connections()}
+
+
+@app.post("/api/connections")
+def api_save_connection(body: dict):
+    """Create/update a connection. Secrets stay in memory; DB keeps only refs."""
+    return connections.upsert_connection(body)
+
+
+@app.delete("/api/connections/{cid}")
+def api_delete_connection(cid: str):
+    connections.delete_connection(cid)
+    return {"ok": True}
+
+
+@app.post("/api/connections/{cid}/test")
+async def api_test_connection(cid: str):
+    """Liveness probe for a connection; never raises."""
+    return await connections.verify(cid)
+
+
+# ---- skill store (MCP market + Agent Skills) ----------------------------
+@app.get("/api/skills/store")
+def api_skill_store(q: str = "", source: str = ""):
+    return {"skills": skill_store.search(q, source)}
+
+
+@app.post("/api/skills/store/install")
+async def api_skill_install(body: SkillInstallMsg):
+    try:
+        return await skill_store.install(body.id, body.source)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+@app.get("/api/skills/installed")
+def api_skills_installed():
+    return {"skills": skill_store.list_installed()}
+
+
+@app.delete("/api/skills/installed/{skill_id}")
+def api_uninstall_skill(skill_id: str):
+    skill_store.uninstall(skill_id)
+    return {"ok": True}
+
+
+# ---- marketplace (dedicated market page: real MCP + skills) --------------
+class InstallCardMsg(BaseModel):
+    card: dict
+
+
+class IdMsg(BaseModel):
+    id: str
+
+
+@app.get("/api/market/mcp")
+async def api_market_mcp(q: str = ""):
+    """Live MCP connector listings — official MCP Registry + Smithery (if key)."""
+    return await marketplace.search_mcp(q)
+
+
+@app.get("/api/market/skills")
+def api_market_skills(q: str = ""):
+    """Skills market listings."""
+    return marketplace.search_skills(q)
+
+
+@app.post("/api/market/mcp/install")
+def api_market_install_mcp(body: InstallCardMsg):
+    """One-click install an MCP server card into the platform catalog."""
+    try:
+        return marketplace.install_mcp(body.card)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+@app.post("/api/market/mcp/uninstall")
+def api_market_uninstall_mcp(body: IdMsg):
+    marketplace.uninstall_mcp(body.id)
+    return {"ok": True}
+
+
+@app.get("/api/market/installed")
+def api_market_installed():
+    """Platform-level installed catalog (MCP + skills) — for the agent picker."""
+    return marketplace.installed()
 
 
 # ---- SSE: normalized event stream (incl. token deltas) ------------------

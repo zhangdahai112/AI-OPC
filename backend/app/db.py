@@ -132,6 +132,16 @@ CREATE TABLE IF NOT EXISTS memory_proposals (
     status     TEXT NOT NULL DEFAULT 'pending',  -- pending|approved|rejected
     created_at REAL NOT NULL
 );
+
+-- Per-(project,role) Agent Manifest overrides. Stores only the *partial*
+-- overrides over the platform default; agents.resolve() deep-merges them.
+CREATE TABLE IF NOT EXISTS agent_manifests (
+    project_id TEXT NOT NULL,
+    role       TEXT NOT NULL,
+    manifest   TEXT NOT NULL,            -- JSON (partial override)
+    updated_at REAL NOT NULL,
+    PRIMARY KEY (project_id, role)
+);
 """
 
 

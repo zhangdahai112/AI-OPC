@@ -4,6 +4,7 @@ import { CFG_SECTIONS } from "../constants";
 import { useState, useEffect, useCallback, useRef } from "react";
 import * as api from "../api";
 import type { FullConfig, LLMProvider } from "../types";
+import Select from "./ui/Select";
 
 export default function ConfigView() {
   const { config, toast, refreshConfig } = useAppState();
@@ -160,14 +161,14 @@ function AgentsSection({
               <div className="ds">{ROLES_DESC[a.role]}</div>
             </div>
             <div className="right">
-              <select
+              <Select
+                size="sm"
+                align="right"
+                style={{ width: 148 }}
                 value={a.exec}
-                onChange={(e) => update(["agents", String(i), "exec"], e.target.value)}
-              >
-                {EXECUTORS.map((ex) => (
-                  <option key={ex} value={ex}>{ex}</option>
-                ))}
-              </select>
+                onChange={(v) => update(["agents", String(i), "exec"], v)}
+                options={[...EXECUTORS]}
+              />
               <Toggle on={a.on} onClick={() => update(["agents", String(i), "on"], !a.on)} />
             </div>
           </div>
@@ -201,13 +202,14 @@ function TemplatesSection({
             </div>
             <div className="right">
               <span className="pill lane">{t.lane}</span>
-              <select
+              <Select
+                size="sm"
+                align="right"
+                style={{ width: 120 }}
                 value={t.lane}
-                onChange={(e) => update(["templates", String(i), "lane"], e.target.value)}
-              >
-                <option value="快车道">快车道</option>
-                <option value="作战群">作战群</option>
-              </select>
+                onChange={(v) => update(["templates", String(i), "lane"], v)}
+                options={["快车道", "作战群"]}
+              />
             </div>
           </div>
           <div className="secrow">
@@ -945,13 +947,14 @@ function ProviderForm({
         </div>
         <div className="field" style={{ flex: 1, marginBottom: 0 }}>
           <label>类型</label>
-          <select value={draft.type} onChange={(e) => {
-            set("type", e.target.value);
-            setDefaultsForType(e.target.value);
-          }} style={{ width: "100%" }}>
-            <option value="anthropic">Anthropic</option>
-            <option value="openai">OpenAI 兼容</option>
-          </select>
+          <Select
+            value={draft.type}
+            onChange={(v) => { set("type", v); setDefaultsForType(v); }}
+            options={[
+              { value: "anthropic", label: "Anthropic" },
+              { value: "openai", label: "OpenAI 兼容" },
+            ]}
+          />
         </div>
       </div>
 

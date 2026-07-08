@@ -4,6 +4,7 @@ import ChannelView from "./components/ChannelView";
 import ProjectsView from "./components/ProjectsView";
 import MetricsView from "./components/MetricsView";
 import ConfigView from "./components/ConfigView";
+import MarketplaceView from "./components/MarketplaceView";
 import NewChannelModal from "./components/NewChannelModal";
 import PrivateChatView from "./components/PrivateChatView";
 import { useState, useEffect } from "react";
@@ -25,6 +26,7 @@ export default function App() {
       case "projects": return <ProjectsView />;
       case "metrics": return <MetricsView />;
       case "config": return <ConfigView />;
+      case "market": return <MarketplaceView />;
       default: return null;
     }
   };

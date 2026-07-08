@@ -10,7 +10,7 @@ import * as api from "./api";
 
 /* ─── State ─── */
 export interface AppState {
-  view: "channels" | "projects" | "metrics" | "config";
+  view: "channels" | "projects" | "metrics" | "config" | "market";
   channels: Channel[];
   activeChannelId: string | null;
   activeChannel: Channel | null;

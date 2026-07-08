@@ -1,6 +1,8 @@
 import type {
   Channel, ChannelMessage, Project, FullConfig, Metrics, LLMStatus,
   LLMProviderStatus, MemoryEntry, AgentRole, Skill, SkillGenResult,
+  AgentManifest, Connection, StoreSkill, InstalledSkill,
+  MarketCard, InstalledCatalog,
 } from "./types";
 
 /* ─── Base HTTP helpers ─── */
@@ -149,6 +151,17 @@ export function getProjectChannels(projectId: string): Promise<Channel[]> {
   return getJSON<Channel[]>(`/api/projects/${projectId}/channels`);
 }
 
+/* ─── Agent Manifests (Agent Studio) ── */
+export function getProjectAgents(projectId: string): Promise<AgentManifest[]> {
+  return getJSON<{ agents: AgentManifest[] }>(`/api/projects/${projectId}/agents`)
+    .then((r) => r.agents);
+}
+export function saveProjectAgent(
+  projectId: string, role: string, manifest: Partial<AgentManifest> | Record<string, unknown>
+): Promise<AgentManifest> {
+  return putJSON<AgentManifest>(`/api/projects/${projectId}/agents/${role}`, { manifest });
+}
+
 /* ─── Config ── */
 export function getConfig(): Promise<FullConfig> {
   return getJSON<FullConfig>("/api/config");
@@ -174,6 +187,57 @@ export function generateWithSkill(payload: {
   skill_id: string; project_id?: string; role?: string; brief?: string;
 }): Promise<SkillGenResult> {
   return postJSON<SkillGenResult>("/api/skills/generate", payload);
+}
+
+/* ─── Connections（凭证/出网连接器） ── */
+export function listConnections(): Promise<Connection[]> {
+  return getJSON<Connection[]>("/api/connections");
+}
+export function saveConnection(data: Partial<Connection> | Record<string, unknown>): Promise<Connection> {
+  return postJSON<Connection>("/api/connections", data);
+}
+export function deleteConnection(id: string): Promise<{ ok: boolean }> {
+  return delJSON<{ ok: boolean }>(`/api/connections/${id}`);
+}
+export function testConnection(id: string): Promise<{ ok: boolean; detail?: string; error?: string }> {
+  return postJSON(`/api/connections/${id}/test`);
+}
+
+/* ─── Skill store（技能市场） ── */
+export function searchSkillStore(q = "", source = ""): Promise<StoreSkill[]> {
+  const params = new URLSearchParams();
+  if (q) params.set("q", q);
+  if (source) params.set("source", source);
+  const qs = params.toString();
+  return getJSON<StoreSkill[]>(`/api/skills/store${qs ? `?${qs}` : ""}`);
+}
+export function installSkill(id: string, source: string): Promise<InstalledSkill> {
+  return postJSON<InstalledSkill>("/api/skills/store/install", { id, source });
+}
+export function listInstalledSkills(): Promise<InstalledSkill[]> {
+  return getJSON<InstalledSkill[]>("/api/skills/installed");
+}
+export function uninstallSkill(id: string): Promise<{ ok: boolean }> {
+  return delJSON<{ ok: boolean }>(`/api/skills/installed/${id}`);
+}
+
+/* ─── Marketplace（独立市场页：真实 MCP + 技能，一键安装） ── */
+export function searchMarketMcp(q = ""): Promise<MarketCard[]> {
+  const qs = q ? `?q=${encodeURIComponent(q)}` : "";
+  return getJSON<MarketCard[]>(`/api/market/mcp${qs}`);
+}
+export function searchMarketSkills(q = ""): Promise<MarketCard[]> {
+  const qs = q ? `?q=${encodeURIComponent(q)}` : "";
+  return getJSON<MarketCard[]>(`/api/market/skills${qs}`);
+}
+export function installMarketMcp(card: MarketCard): Promise<{ ok?: boolean }> {
+  return postJSON("/api/market/mcp/install", { card });
+}
+export function uninstallMarketMcp(id: string): Promise<{ ok: boolean }> {
+  return postJSON("/api/market/mcp/uninstall", { id });
+}
+export function getInstalledCatalog(): Promise<InstalledCatalog> {
+  return getJSON<InstalledCatalog>("/api/market/installed");
 }
 
 /* ─── Metrics & LLM ── */

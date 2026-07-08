@@ -173,6 +173,102 @@ export interface MemoryEntry {
   scope: string; source: string; line: number; text: string;
 }
 
+/* ── Agent Manifest (per-project, per-role config) ── */
+export interface AgentManifest {
+  apiVersion: string;
+  kind: string;
+  role: AgentRole;
+  identity: { role: AgentRole; name: string; avatar: string; focus?: string };
+  model: { provider: string; model: string; maxTokens: number; effort: string };
+  prompt: { charter: string; guardrails: string[] };
+  harness: { builtinTools: string[]; toolPolicy: Record<string, string> };
+  mcp: unknown[];
+  skills: unknown[];
+  memory: { scopes: string[] };
+  budget: { maxTokens: number; maxCostUsd: number };
+  enabled: boolean;
+  inherited: boolean;
+}
+
+/* ── Connections (credential vault / egress) ── */
+export interface Connection {
+  id: string;
+  type: string;               // github / http / postgres
+  name?: string;
+  key_configured?: boolean;   // 是否已配置密钥（不含明文）
+  [k: string]: unknown;       // 其它非密元数据（host/url/...）
+}
+
+/* ── Skill store (Agent Skills / MCP market) ── */
+export interface StoreSkill {
+  id: string;
+  name: string;
+  description: string;
+  source: string;             // anthropic / smithery / builtin
+  version?: string;
+  permissions: string[];      // 安装所需权限
+}
+
+export interface InstalledSkill {
+  id: string;
+  name: string;
+  description?: string;
+  source: string;
+  version?: string;
+  permissions?: string[];
+}
+
+/* ── MCP mount (manifest.mcp 每一项) ── */
+export interface McpMount {
+  server: string;
+  transport: "http" | "stdio";
+  url?: string;
+  command?: string;
+  ref?: string;
+  tools?: string[];
+}
+
+/* ── Agent-attached skill (manifest.skills 每一项) ── */
+export interface AgentSkillRef {
+  id: string;
+  source: string;
+  version?: string;
+}
+
+/* ── Marketplace ── */
+export interface MarketCard {
+  id: string;
+  source: string;             // official / smithery / anthropic / builtin
+  name: string;
+  description: string;
+  homepage?: string;
+  icon?: string;
+  transport?: "http" | "stdio";
+  mount?: McpMount;           // MCP 卡片携带的挂载
+  verified?: boolean;
+  useCount?: number;
+  permissions?: string[];     // skill 卡片
+  kind?: string;              // "skill" for skill cards
+  version?: string;
+}
+
+export interface InstalledMcp {
+  id: string;
+  name: string;
+  description?: string;
+  source: string;
+  homepage?: string;
+  icon?: string;
+  mount: McpMount;
+  needs_key?: boolean;
+  installed_at?: number;
+}
+
+export interface InstalledCatalog {
+  mcp: InstalledMcp[];
+  skills: InstalledSkill[];
+}
+
 /* ── Generation skills ── */
 export interface Skill {
   id: string;

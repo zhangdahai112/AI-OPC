@@ -37,9 +37,13 @@ _DANGER = (
 
 
 # ── tool schema (Anthropic tool-use format) ────────────────────────────────
-def tool_specs() -> list[dict[str, Any]]:
-    """JSON schema for every tool, in Anthropic ``tools=`` format."""
-    return [
+def tool_specs(allow: set[str] | None = None) -> list[dict[str, Any]]:
+    """JSON schema for the tools, in Anthropic ``tools=`` format.
+
+    ``allow`` is the least-privilege gate from the agent's manifest: when given,
+    only tools whose name is in the set are exposed to the model.
+    """
+    specs = [
         {
             "name": "list_dir",
             "description": "列出项目仓库里某个目录的文件与子目录。path 相对仓库根，默认根目录。",
@@ -89,6 +93,9 @@ def tool_specs() -> list[dict[str, Any]]:
             },
         },
     ]
+    if allow is not None:
+        specs = [s for s in specs if s["name"] in allow]
+    return specs
 
 
 # ── execution context ──────────────────────────────────────────────────────
