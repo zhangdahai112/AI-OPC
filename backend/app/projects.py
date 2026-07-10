@@ -12,10 +12,11 @@ checkout and also fed to agents, so answers are grounded in the real codebase.
 from __future__ import annotations
 
 import subprocess
+import threading
 from pathlib import Path
 
 from . import db
-from .config import MEMORY_DIR, WORKSPACES_DIR
+from .config import AGENT_REPOS_DIR, MEMORY_DIR, WORKSPACES_DIR
 
 ROLES = ["coordinator", "analyst", "developer", "tester", "devops", "reporter"]
 ROLE_CN = {"coordinator": "项目经理", "analyst": "需求分析", "developer": "开发",
@@ -86,6 +87,73 @@ def clone_repo(pid: str) -> dict:
     return get_project(pid)
 
 
+# ---- per-agent independent git repos ------------------------------------
+# Each agent role gets its OWN independent clone (its own .git / history / index),
+# NOT a git worktree and NOT a submodule of the base checkout — agent repos are
+# mutually independent and not subordinate to any trunk. They are seeded from the
+# local base clone (fast, offline) but their ``origin`` points at the real
+# upstream, so the internal base is just a seed, not a parent. Cloning is
+# serialized so concurrent first-use of the same base doesn't lock-fight.
+_WT_LOCK = threading.Lock()
+
+
+def agent_repo_path(pid: str, role: str) -> Path:
+    return AGENT_REPOS_DIR / pid / role
+
+
+def ensure_agent_repo(pid: str, role: str) -> Path | None:
+    """Return the agent's independent clone for (pid, role), creating it on first
+    use. Returns ``None`` when the project has no git source to clone from."""
+    p = get_project(pid)
+    if not p or not p.get("local_path"):
+        return None
+    base = Path(p["local_path"])
+    dest = agent_repo_path(pid, role)
+    if (dest / ".git").exists():        # already cloned (fast path, no lock)
+        return dest
+    # seed source: the local base checkout if it's a git repo, else the remote.
+    seed = str(base) if (base / ".git").exists() else (p.get("repo_url") or "")
+    if not seed:
+        return None                     # nothing to clone → can't isolate
+    with _WT_LOCK:
+        if (dest / ".git").exists():    # double-check under lock
+            return dest
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        # a full, independent clone (own object store) — not a worktree, not a
+        # shared-.git; ``--no-hardlinks`` so nothing is physically shared either.
+        rc, out = _git(str(dest.parent), "clone", "--no-hardlinks", seed, role)
+        ok = rc == 0
+        if ok:
+            # decouple from the internal seed: point origin at the real upstream
+            # (so this repo relates to the project's real remote, not our base).
+            if p.get("repo_url"):
+                _git(str(dest), "remote", "set-url", "origin", p["repo_url"])
+            _git(str(dest), "checkout", "-B", f"agent/{role}")
+            # give the repo its own git identity so agent commits succeed even
+            # with no global identity, and self-identify which agent committed.
+            _git(str(dest), "config", "user.name", f"agent-{role}")
+            _git(str(dest), "config", "user.email", f"{role}@warroom.local")
+        db.audit("tool", actor="engine",
+                 detail={"agent_repo": pid, "role": role,
+                         "status": "ready" if ok else "error",
+                         **({} if ok else {"log": out[-400:]})})
+        return dest if ok else None
+
+
+def agent_root(pid: str, role: str | None = None) -> Path | None:
+    """The directory an agent operates in: its own independent per-role clone when
+    the project has a git source, otherwise the shared checkout (or None)."""
+    p = get_project(pid)
+    if not p or not p.get("local_path"):
+        return None
+    if role:
+        repo = ensure_agent_repo(pid, role)
+        if repo:
+            return repo
+    base = Path(p["local_path"])
+    return base if base.exists() else None
+
+
 def get_project(pid: str) -> dict | None:
     row = db.query_one("SELECT * FROM projects WHERE id=?", (pid,))
     return dict(row) if row else None
@@ -146,7 +214,27 @@ _IGNORE_DIRS = {".git", "node_modules", ".venv", "venv", "__pycache__",
                 "dist", "build", ".next", ".cache", "coverage", ".idea",
                 ".vscode", "target", "vendor"}
 _SRC_EXTS = {".py", ".ts", ".tsx", ".js", ".jsx", ".vue", ".css", ".scss",
-             ".html", ".json", ".md", ".yml", ".yaml", ".go", ".rs", ".java"}
+             ".html", ".json", ".md", ".yml", ".yaml", ".go", ".rs", ".java",
+             # config / infra / script / other languages — these often hold the
+             # real answer (nginx 防盗链、OSS 加密、密钥、SQL、Dockerfile 等)。
+             ".env", ".sh", ".bash", ".conf", ".cfg", ".ini", ".toml", ".sql",
+             ".proto", ".txt", ".xml", ".gradle", ".properties", ".php", ".rb",
+             ".kt", ".c", ".cc", ".cpp", ".h", ".hpp", ".cs", ".swift", ".dart"}
+
+# Important files that have no (or a non-source) extension but are worth searching.
+_SEARCH_NAMES = {"dockerfile", "makefile", "nginx.conf", ".env", ".env.local",
+                 ".env.production", ".env.development", "caddyfile", ".htaccess"}
+
+
+def _is_searchable(f: Path) -> bool:
+    """Whether grep should scan this file: known source/config extension, a
+    known config filename, or a dot-env variant (.env, .env.prod, ...)."""
+    name = f.name.lower()
+    if f.suffix.lower() in _SRC_EXTS:
+        return True
+    if name in _SEARCH_NAMES:
+        return True
+    return name.startswith(".env")
 
 
 def _walk_files(root: Path, max_files: int):
@@ -162,14 +250,36 @@ def _walk_files(root: Path, max_files: int):
                 return
 
 
-def repo_context(pid: str, max_files: int = 80) -> str:
-    """A compact file tree + README excerpt, fed to agents so answers are
-    grounded in the actual checkout (code is the source of truth)."""
+def _doc_leads(root: Path, cap: int = 40) -> list[str]:
+    """Design docs / guides / CLAUDE.md worth reading FIRST — they often name the
+    answer's entry point directly (e.g. docs/bng-encryption.html). Surfaced
+    separately because the 80-file tree is alpha-truncated and usually cuts off
+    before docs/ or deep util dirs. Ranked so design/security docs float up."""
+    HINT = ("claude", "readme", "design", "arch", "prd", "spec", "guide",
+            "encrypt", "crypto", "secur", "auth", "api", "doc", "开发", "方案", "设计")
+    docs: list[tuple[int, str]] = []
+    for f in _walk_files(root, max_files=3000):
+        name = f.name.lower()
+        if f.suffix.lower() not in (".md", ".html", ".htm", ".rst", ".txt") and name != "claude.md":
+            continue
+        rel = str(f.relative_to(root)).replace("\\", "/")
+        low = rel.lower()
+        score = sum(1 for h in HINT if h in low)
+        docs.append((score, rel))
+    docs.sort(key=lambda x: (-x[0], len(x[1]), x[1]))
+    return [rel for _, rel in docs[:cap]]
+
+
+def repo_context(pid: str, max_files: int = 80, role: str | None = None) -> str:
+    """A compact file tree + doc leads + README excerpt, fed to agents so answers
+    are grounded in the actual checkout (code is the source of truth). When
+    ``role`` is given the agent sees its own worktree, so its prior writes are
+    visible."""
     p = get_project(pid)
     if not p:
         return ""
-    root = Path(p["local_path"])
-    if not root.exists():
+    root = agent_root(pid, role) if role else Path(p["local_path"])
+    if not root or not root.exists():
         return f"项目「{p['name']}」尚无本地代码（repo: {p['repo_url'] or '未配置'}）。"
     lines = [f"项目「{p['name']}」代码库（{p['repo_url'] or 'local'} @ {p['branch']}）文件树："]
     files = list(_walk_files(root, max_files))
@@ -177,6 +287,11 @@ def repo_context(pid: str, max_files: int = 80) -> str:
         lines.append(f"  {f.relative_to(root)}")
     if len(files) >= max_files:
         lines.append("  …（文件树已截断，可用 read_file 读取具体文件）")
+    leads = _doc_leads(root)
+    if leads:
+        lines.append("\n📎 设计文档 / 说明（回答前优先扫这些找方案线索，"
+                     "文件树可能已把它们截断）：")
+        lines.extend(f"  {l}" for l in leads)
     for readme in ("README.md", "readme.md", "README.txt"):
         rp = root / readme
         if rp.exists():
@@ -209,25 +324,61 @@ def read_file(pid: str, rel_path: str, max_chars: int = 6000) -> str:
     return text
 
 
-def grep_repo(pid: str, pattern: str, max_hits: int = 40) -> list[dict]:
-    """Search the project's checkout for a substring (case-insensitive)."""
-    p = get_project(pid)
-    if not p:
-        return []
-    root = Path(p["local_path"])
+_GREP_WALK_CAP = 6000  # max files walked before we admit the scan was truncated
+
+
+def grep_repo(pid: str, pattern: str, max_hits: int = 40,
+              root: Path | None = None) -> dict:
+    """Search a checkout with a **regex** (case-insensitive). ``root`` overrides
+    the base checkout so a tool call can search the agent's own worktree.
+
+    Returns a dict so the caller can surface honest truncation signals instead of
+    letting "no hits" be mistaken for "the thing doesn't exist":
+        hits           list[{file,line,text}]
+        files_scanned  how many files were actually grepped
+        truncated_hits max_hits reached — there may be more matches
+        truncated_files the file walk hit its cap — some dirs went unscanned
+        regex_ok       False if pattern was an invalid regex (fell back to literal)
+    """
+    import re
+    empty = {"hits": [], "files_scanned": 0, "truncated_hits": False,
+             "truncated_files": False, "regex_ok": True}
+    if root is None:
+        p = get_project(pid)
+        if not p:
+            return empty
+        root = Path(p["local_path"])
     if not root.exists():
-        return []
-    pl, hits = pattern.lower(), []
-    for f in _walk_files(root, max_files=2000):
-        if f.suffix.lower() not in _SRC_EXTS:
+        return empty
+
+    regex_ok = True
+    try:
+        rx = re.compile(pattern, re.IGNORECASE)
+    except re.error:
+        rx = re.compile(re.escape(pattern), re.IGNORECASE)
+        regex_ok = False
+
+    hits: list[dict] = []
+    walked = files_scanned = 0
+    truncated_hits = False
+    for f in _walk_files(root, max_files=_GREP_WALK_CAP):
+        walked += 1
+        if not _is_searchable(f):
             continue
+        files_scanned += 1
         try:
             for i, line in enumerate(f.read_text(encoding="utf-8", errors="replace").splitlines(), 1):
-                if pl in line.lower():
+                if rx.search(line):
                     hits.append({"file": str(f.relative_to(root)), "line": i,
                                  "text": line.strip()[:200]})
                     if len(hits) >= max_hits:
-                        return hits
+                        truncated_hits = True
+                        break
         except OSError:
             continue
-    return hits
+        if truncated_hits:
+            break
+    return {"hits": hits, "files_scanned": files_scanned,
+            "truncated_hits": truncated_hits,
+            "truncated_files": walked >= _GREP_WALK_CAP,
+            "regex_ok": regex_ok}

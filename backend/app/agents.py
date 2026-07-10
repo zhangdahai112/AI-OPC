@@ -39,12 +39,14 @@ except Exception:  # pragma: no cover — defensive, skills should always import
 MANIFEST_VERSION = "warroom/v1"
 
 # ── built-in tool sets (least privilege by role) ───────────────────────────
-_ALL_TOOLS = ["list_dir", "read_file", "grep", "write_file", "run_command"]
-_READONLY_TOOLS = ["list_dir", "read_file", "grep"]
+# "explore" = read-only fan-out investigation sub-agent (safe for every tool role)
+_ALL_TOOLS = ["list_dir", "read_file", "grep", "repo_map", "explore",
+              "write_file", "run_command"]
+_READONLY_TOOLS = ["list_dir", "read_file", "grep", "repo_map", "explore"]
 
 # developer/tester/devops actually change the repo; the rest are read-only.
 _ROLE_TOOLS: dict[str, list[str]] = {
-    "coordinator": _READONLY_TOOLS,
+    "coordinator": [],           # PM only routes & manages — never touches tools
     "analyst": _READONLY_TOOLS,
     "developer": _ALL_TOOLS,
     "tester": _ALL_TOOLS,

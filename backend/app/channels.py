@@ -150,6 +150,27 @@ def post_message(cid: str, kind: str, *, role: str | None = None,
         (cid, kind, role, db.dumps(payload), db.now()))
 
 
+def delete_message(cid: str, mid: int) -> bool:
+    """Delete a single message from a channel. Returns True if a row was removed."""
+    row = db.query_one(
+        "SELECT id FROM channel_messages WHERE id=? AND channel_id=?", (mid, cid))
+    if not row:
+        return False
+    db.execute("DELETE FROM channel_messages WHERE id=?", (mid,))
+    db.audit("decision", actor="human",
+             detail={"channel_message_deleted": mid, "channel": cid})
+    return True
+
+
+def clear_messages(cid: str) -> int:
+    """Delete all messages in a channel. Returns the number of rows removed."""
+    n = db.query_one(
+        "SELECT COUNT(*) AS c FROM channel_messages WHERE channel_id=?", (cid,))
+    db.execute("DELETE FROM channel_messages WHERE channel_id=?", (cid,))
+    db.audit("decision", actor="human", detail={"channel_cleared": cid})
+    return dict(n).get("c", 0) if n else 0
+
+
 # ---- migrate from tickets -----------------------------------------------
 
 def migrate_from_tickets() -> dict:

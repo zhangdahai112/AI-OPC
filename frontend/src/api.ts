@@ -77,6 +77,23 @@ export function sendChannelMessage(
   return postJSON<Channel>(`/api/channels/${channelId}/messages`, { text });
 }
 
+export function deleteChannelMessage(
+  channelId: string,
+  messageId: number | string
+): Promise<{ ok: boolean }> {
+  return delJSON<{ ok: boolean }>(
+    `/api/channels/${channelId}/messages/${messageId}`
+  );
+}
+
+export function clearChannelMessages(
+  channelId: string
+): Promise<{ ok: boolean; removed: number }> {
+  return delJSON<{ ok: boolean; removed: number }>(
+    `/api/channels/${channelId}/messages`
+  );
+}
+
 export function getChannelProjects(id: string): Promise<{ project_id: string }[]> {
   return getJSON<{ project_id: string }[]>(`/api/channels/${id}/projects`);
 }

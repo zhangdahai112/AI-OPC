@@ -482,6 +482,22 @@ def api_post_message(cid: str, body: ChatMsg):
     return channels.get_channel(cid)
 
 
+@app.delete("/api/channels/{cid}/messages")
+def api_clear_channel_messages(cid: str):
+    if not channels.get_channel(cid):
+        raise HTTPException(404, "channel not found")
+    removed = channels.clear_messages(cid)
+    return {"ok": True, "removed": removed}
+
+
+@app.delete("/api/channels/{cid}/messages/{mid}")
+def api_delete_channel_message(cid: str, mid: int):
+    if not channels.get_channel(cid):
+        raise HTTPException(404, "channel not found")
+    channels.delete_message(cid, mid)
+    return {"ok": True}
+
+
 @app.get("/api/channels/{cid}/projects")
 def api_channel_projects(cid: str):
     return channels.list_channel_projects(cid)

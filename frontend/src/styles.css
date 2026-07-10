@@ -119,13 +119,20 @@ input,textarea,select{font-family:inherit}
 .pchip.fail .d{background:var(--bad)} .pchip.fail{color:var(--bad)}
 
 .stream{flex:1;overflow-y:auto;padding:24px 22px 10px;scroll-behavior:smooth;background:var(--ink)}
-.row{display:flex;gap:12px;margin-bottom:20px;max-width:800px}
+.row{display:flex;gap:12px;margin-bottom:20px;max-width:960px}
 .av{width:32px;height:32px;border-radius:9px;flex:none;display:grid;place-items:center;font-size:11px;font-weight:600;font-family:var(--mono)}
 .av.coordinator,.av.developer{background:var(--agent-bg);color:var(--agent)}
 .av.analyst{background:#e4ecf3;color:#3a6ea5}
 .av.tester{background:#ece6f5;color:#6b4fa0}
 .av.devops{background:var(--ok-bg);color:var(--ok)}
 .av.reporter{background:var(--warn-bg);color:var(--warn)}
+.chead-clear{font-size:11.5px;color:var(--tx2);background:var(--panel);border:1px solid var(--line);
+  border-radius:7px;padding:3px 10px;cursor:pointer;transition:.14s;white-space:nowrap}
+.chead-clear:hover{border-color:var(--bad);color:var(--bad);background:var(--bad-bg)}
+.msg-del{border:none;background:transparent;color:var(--tx3);font-size:12px;line-height:1;
+  padding:2px 5px;border-radius:5px;cursor:pointer;opacity:0;transition:.14s}
+.row:hover .msg-del{opacity:.6}
+.msg-del:hover{opacity:1;color:var(--bad);background:var(--bad-bg)}
 .who{display:flex;align-items:baseline;gap:9px;margin-bottom:4px}
 .who b{font-size:13px;font-weight:600;color:var(--tx)}
 .who .t{font-size:11px;color:var(--tx3);margin-left:auto;font-family:var(--mono)}
@@ -136,7 +143,7 @@ input,textarea,select{font-family:inherit}
 
 /* Manus-ism: assistant messages are plain text (no bubble),
    the human message sits in a soft rounded card aligned right */
-.row.human{flex-direction:row-reverse;margin-left:auto;max-width:640px}
+.row.human{flex-direction:row-reverse;margin-left:auto;max-width:720px}
 .row.human .who{flex-direction:row-reverse}
 .row.human .who .t{margin-left:0;margin-right:auto}
 .row.human .av{background:var(--human-bg);color:var(--human)}
@@ -248,7 +255,7 @@ input,textarea,select{font-family:inherit}
 .cfgnav .item .ic{width:18px;flex:none;display:grid;place-items:center;color:var(--tx3);transition:color .13s}
 .cfgnav .item:hover .ic{color:var(--tx2)}
 .cfgnav .item.on .ic{color:var(--agent)}
-.cfgwrap{overflow-y:auto;padding:30px 40px;max-width:860px;width:100%;margin:0 auto}
+.cfgwrap{overflow-y:auto;padding:30px 40px;width:100%}
 .cfgwrap h2{font-size:20px;font-weight:600;margin:0 0 6px;color:var(--tx)}
 .cfgwrap .lead{color:var(--tx2);font-size:13.5px;margin:0 0 24px}
 .secbox{background:var(--ink);border:1px solid var(--line);border-radius:14px;margin-bottom:16px;overflow:hidden;box-shadow:var(--shadow-sm)}
@@ -424,6 +431,18 @@ select:focus{outline:none;border-color:var(--agent)}
 .live-tool .lt-spin{margin-left:auto;flex:none;width:12px;height:12px;border-radius:50%;
   border:2px solid var(--agent);border-top-color:transparent;animation:spin .7s linear infinite}
 
+/* ── 过程区（工具调用）：与「思考」同一套 muted 视觉，和下方回答明确区分 ── */
+.proc{border:1px solid var(--line);border-radius:10px;background:var(--ink);
+  padding:7px 9px 8px;margin:2px 0 9px}
+.proc-hd{display:flex;align-items:center;gap:7px;font-size:11.5px;font-weight:600;
+  color:var(--tx2);margin-bottom:7px}
+.proc-hd .proc-ic{font-size:13px;flex:none}
+.proc-hd .proc-tag{margin-left:auto;font-size:10px;font-weight:600;color:var(--tx3);
+  background:var(--elev2);padding:1px 8px;border-radius:20px;letter-spacing:.04em}
+.proc-tools{display:flex;flex-direction:column;gap:5px}
+/* answer bubble = 主体回答，用左侧强调条把「回答」和上方 muted 过程区拉开层级 */
+.bubble.answer{border-left:2px solid var(--agent-bg);padding-left:10px;margin-left:-2px}
+
 /* ── stream empty state ── */
 .stream-empty{max-width:420px;margin:auto;text-align:center;padding:40px 20px;animation:rowIn .4s ease}
 .stream-empty .se-ic{font-size:40px;margin-bottom:14px;opacity:.85}
@@ -567,13 +586,14 @@ select:focus{outline:none;border-color:var(--agent)}
 .dtl-hd:hover{color:var(--tx)}
 .dtl-caret{color:var(--tx3);font-size:10px;transition:transform .18s;flex:none}
 .dtl.open .dtl-caret{transform:rotate(90deg);color:var(--accent)}
-.dtl-ic{font-size:13px;flex:none}
+.dtl-ic{font-size:13px;flex:none;width:18px;text-align:center}
 .dtl-step{flex:none;font-size:10px;font-weight:700;min-width:16px;height:16px;padding:0 4px;
   display:inline-grid;place-items:center;border-radius:5px;background:var(--accent-bg);color:var(--accent)}
-.dtl-label{font-weight:600;flex:none;color:var(--agent)}
+.dtl-label{font-weight:600;flex:none;color:var(--agent);font-size:12px}
 .dtl.tool .dtl-label{color:var(--accent)}
 .dtl-meta{color:var(--tx3);font-weight:400;overflow:hidden;text-overflow:ellipsis;
-  white-space:nowrap;min-width:0}
+  white-space:nowrap;min-width:0;font-size:11px}
+.dtl-meta::before{content:"";display:none}
 .dtl-body{padding:2px 12px 11px;animation:dtlIn .18s ease}
 @keyframes dtlIn{from{opacity:0;transform:translateY(-3px)}to{opacity:1;transform:translateY(0)}}
 .dtl-think{font-size:12.5px;line-height:1.75;color:var(--tx2);white-space:pre-wrap;

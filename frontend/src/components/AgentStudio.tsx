@@ -21,6 +21,7 @@ const TOOLS: { key: string; label: string }[] = [
   { key: "list_dir", label: "列目录" },
   { key: "read_file", label: "读文件" },
   { key: "grep", label: "搜索" },
+  { key: "repo_map", label: "仓库地图" },
   { key: "write_file", label: "写文件" },
   { key: "run_command", label: "跑命令" },
 ];

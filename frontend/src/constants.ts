@@ -13,7 +13,7 @@ export const ROLES: Record<
 };
 
 export const ROLES_DESC: Record<AgentRole, string> = {
-  coordinator: "拆解任务、分派、处理升级",
+  coordinator: "纯路由与管控：拆解分派、汇总进度、处理升级",
   analyst: "把需求理清成规格",
   developer: "写代码、改 bug、提交",
   tester: "写用例、跑测试",

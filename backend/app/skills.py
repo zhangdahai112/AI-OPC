@@ -103,7 +103,9 @@ _TECHSPEC_SKILL = Skill(
 # role -> (zh name, icon, one-line expertise focus)
 _ROLE_EXPERTISE: dict[str, tuple[str, str, str]] = {
     "coordinator": ("项目经理", "🎯",
-                    "统筹拆解需求、按职责分派、汇总进度、判断路由与处理升级"),
+                    "纯路由与管控角色：拆解需求、按职责分派给对应成员、汇总进度、"
+                    "判断升级——不亲自读代码、不写文件、不跑命令，所有具体执行交给"
+                    "对应的专业 agent。"),
     "analyst": ("需求分析", "🔍",
                 "澄清模糊需求、消除歧义、产出可验收的规格与验收标准"),
     "developer": ("开发工程师", "💻",

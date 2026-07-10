@@ -42,7 +42,19 @@ from typing import Any, Awaitable, Callable
 
 import httpx
 
+from .config import LLM_MAX_TOKENS_CEILING, LLM_MAX_TOOL_ITERS
 from .config import has_api_key as _has_key_compat
+
+
+def _clamp_tokens(max_tokens: int | None, provider: dict[str, Any]) -> int:
+    """Effective per-call output-token limit, hard-capped so a misconfigured
+    provider (e.g. max_tokens=111111) can't let one turn stream for minutes."""
+    want = max_tokens or provider.get("max_tokens") or 4096
+    try:
+        want = int(want)
+    except (TypeError, ValueError):
+        want = 4096
+    return max(256, min(want, LLM_MAX_TOKENS_CEILING))
 
 # ---------------------------------------------------------------------------
 # Public helpers
@@ -52,7 +64,8 @@ OnDelta = Callable[[str], Awaitable[None]]
 # on_tool(name, input, tool_use_id) -> awaitable[str result]
 OnTool = Callable[[str, dict, str], Awaitable[str]]
 
-MAX_TOOL_ITERS = 12  # cap the tool-use loop so an agent can't spin forever
+# cap the tool-use loop so an agent can't spin forever (configurable, see config)
+MAX_TOOL_ITERS = LLM_MAX_TOOL_ITERS
 
 
 def get_providers_config() -> dict[str, Any]:
@@ -146,6 +159,7 @@ async def stream_reply(
     max_tokens: int | None = None,
     tools: list[dict[str, Any]] | None = None,
     on_tool: OnTool | None = None,
+    max_iters: int | None = None,
 ) -> dict[str, Any]:
     """Stream one assistant turn through the configured (or specified) provider.
 
@@ -153,9 +167,10 @@ async def stream_reply(
     When no usable provider is available a placeholder message is streamed so the
     UI keeps working in demo mode.
 
-    When ``tools`` and ``on_tool`` are supplied (Anthropic only), this runs a full
-    tool-use loop: the model may call tools, each call is dispatched through
-    ``on_tool``, and the result is fed back until the model stops calling tools.
+    When ``tools`` and ``on_tool`` are supplied, this runs a full tool-use loop
+    (supported for both Anthropic and OpenAI-compatible providers): the model may
+    call tools, each call is dispatched through ``on_tool``, and the result is fed
+    back until the model stops calling tools.
     """
     provider = _resolve_provider(provider_id)
     if not provider:
@@ -170,10 +185,10 @@ async def stream_reply(
     try:
         if ptype == "anthropic":
             return await _anthropic_stream(system, messages, on_delta, provider,
-                                           effort, max_tokens, tools, on_tool)
+                                           effort, max_tokens, tools, on_tool, max_iters)
         elif ptype == "openai":
             return await _openai_stream(system, messages, on_delta, provider,
-                                        effort, max_tokens)
+                                        effort, max_tokens, tools, on_tool, max_iters)
         else:
             msg = f"（不支持的供应商类型：{ptype}）"
             await on_delta(msg)
@@ -231,6 +246,7 @@ async def _anthropic_stream(
     max_tokens: int | None,
     tools: list[dict[str, Any]] | None = None,
     on_tool: OnTool | None = None,
+    max_iters: int | None = None,
 ) -> dict[str, Any]:
     import anthropic
 
@@ -243,13 +259,15 @@ async def _anthropic_stream(
     client = anthropic.AsyncAnthropic(api_key=key,
                                       base_url=provider.get("base_url") or None)
     model = provider.get("model", "claude-sonnet-4-6")
-    max_tok = max_tokens or provider.get("max_tokens", 4096)
+    max_tok = _clamp_tokens(max_tokens, provider)
 
     use_tools = bool(tools and on_tool)
+    iters = max_iters or MAX_TOOL_ITERS
     convo: list[dict[str, Any]] = list(messages)
     text_parts: list[str] = []
     in_tok = out_tok = 0
     final = None
+    concluded = not use_tools
 
     # ── prompt caching (KV cost optimization) ──────────────────────────────
     # Cache the stable prefix — the tool schema and the system prompt — so a
@@ -267,8 +285,18 @@ async def _anthropic_stream(
         cached_tools[-1] = {**cached_tools[-1],
                             "cache_control": {"type": "ephemeral"}}
 
+    async def _run(kwargs: dict[str, Any]):
+        nonlocal final, in_tok, out_tok
+        async with client.messages.stream(**kwargs) as stream:
+            async for text in stream.text_stream:
+                text_parts.append(text)
+                await on_delta(text)
+            final = await stream.get_final_message()
+        in_tok += getattr(final.usage, "input_tokens", 0) or 0
+        out_tok += getattr(final.usage, "output_tokens", 0) or 0
+
     try:
-        for _ in range(MAX_TOOL_ITERS if use_tools else 1):
+        for _ in range(iters if use_tools else 1):
             kwargs: dict[str, Any] = {
                 "model": model,
                 "max_tokens": max_tok,
@@ -277,20 +305,16 @@ async def _anthropic_stream(
             }
             if use_tools:
                 kwargs["tools"] = cached_tools
-            async with client.messages.stream(**kwargs) as stream:
-                async for text in stream.text_stream:
-                    text_parts.append(text)
-                    await on_delta(text)
-                final = await stream.get_final_message()
-            in_tok += getattr(final.usage, "input_tokens", 0) or 0
-            out_tok += getattr(final.usage, "output_tokens", 0) or 0
+            await _run(kwargs)
 
             if not use_tools or final.stop_reason != "tool_use":
+                concluded = True
                 break
 
             tool_uses = [b for b in final.content
                          if getattr(b, "type", None) == "tool_use"]
             if not tool_uses:
+                concluded = True
                 break
             # replay the assistant turn, then answer every tool call
             convo.append({"role": "assistant",
@@ -301,6 +325,15 @@ async def _anthropic_stream(
                 results.append({"type": "tool_result", "tool_use_id": b.id,
                                 "content": result})
             convo.append({"role": "user", "content": results})
+
+        # hit the tool-call budget without concluding → force a final tool-free
+        # answer so the turn returns a real synthesis, not an empty string.
+        if use_tools and not concluded:
+            convo.append({"role": "user", "content":
+                          "（已达工具调用上限）请立即基于你已查到的信息给出最终结论，不要再调用工具。"})
+            await _run({"model": model, "max_tokens": max_tok,
+                        "system": sys_param, "messages": convo})
+
         usage = {"input_tokens": in_tok, "output_tokens": out_tok}
         return {"text": "".join(text_parts), "usage": usage,
                 "stop_reason": final.stop_reason if final else "end"}
@@ -316,6 +349,37 @@ async def _anthropic_stream(
 # ---------------------------------------------------------------------------
 
 
+def _trim_tool_history(convo: list[dict[str, Any]], keep_last: int = 4,
+                       cap: int = 900) -> None:
+    """Cap the cost of the OpenAI tool-loop. Each iteration re-sends the whole
+    transcript; a single ``repo_map`` result is ~35KB, so without trimming a
+    12-round loop balloons to hundreds of thousands of input tokens. Truncate the
+    *content* (never drop the message — OpenAI requires every tool_call to have a
+    matching tool result) of all but the most recent ``keep_last`` tool outputs."""
+    tool_idxs = [i for i, m in enumerate(convo) if m.get("role") == "tool"]
+    for i in tool_idxs[:-keep_last] if keep_last else tool_idxs:
+        c = convo[i].get("content") or ""
+        if len(c) > cap:
+            convo[i] = {**convo[i],
+                        "content": c[:cap] + "\n…（早期工具输出已截断以节省上下文）"}
+
+
+def _to_openai_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Convert Anthropic-shaped tool specs ({name, description, input_schema})
+    into OpenAI function-calling specs ({type:function, function:{...}})."""
+    out: list[dict[str, Any]] = []
+    for t in tools:
+        out.append({
+            "type": "function",
+            "function": {
+                "name": t["name"],
+                "description": t.get("description", ""),
+                "parameters": t.get("input_schema") or {"type": "object", "properties": {}},
+            },
+        })
+    return out
+
+
 async def _openai_stream(
     system: str,
     messages: list[dict[str, Any]],
@@ -323,6 +387,9 @@ async def _openai_stream(
     provider: dict[str, Any],
     effort: str | None,
     max_tokens: int | None,
+    tools: list[dict[str, Any]] | None = None,
+    on_tool: OnTool | None = None,
+    max_iters: int | None = None,
 ) -> dict[str, Any]:
     key = _resolve_api_key(provider)
     if not key:
@@ -332,47 +399,124 @@ async def _openai_stream(
 
     model = provider.get("model", "gpt-4o")
     base_url = provider.get("base_url", "https://api.openai.com/v1").rstrip("/")
-    max_tok = max_tokens or provider.get("max_tokens", 4096)
+    max_tok = _clamp_tokens(max_tokens, provider)
+    iters = max_iters or MAX_TOOL_ITERS
+
+    use_tools = bool(tools and on_tool)
+    oa_tools = _to_openai_tools(tools) if use_tools else None
+    # the running OpenAI-format transcript; assistant/tool turns get appended as
+    # the tool-use loop progresses so the model sees each tool's real output.
+    convo: list[dict[str, Any]] = [{"role": "system", "content": system}] + list(messages)
+    headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
 
     text_parts: list[str] = []
+    usage = {"in": 0, "out": 0}
+
+    async def _once(client: "httpx.AsyncClient", include_tools: bool):
+        """Stream one chat.completions call. Returns (finish_reason, tool frags)."""
+        body: dict[str, Any] = {"model": model, "max_tokens": max_tok,
+                                "stream": True, "messages": convo}
+        if include_tools:
+            body["tools"] = oa_tools
+            body["tool_choice"] = "auto"
+            body["stream_options"] = {"include_usage": True}
+        iter_text: list[str] = []
+        frags: dict[int, dict[str, str]] = {}
+        finish: str | None = None
+        async with client.stream("POST", f"{base_url}/chat/completions",
+                                 json=body, headers=headers) as resp:
+            resp.raise_for_status()
+            async for line in resp.aiter_lines():
+                if not line.startswith("data: "):
+                    continue
+                data = line[6:].strip()
+                if data == "[DONE]":
+                    break
+                try:
+                    chunk = json.loads(data)
+                except json.JSONDecodeError:
+                    continue
+                u = chunk.get("usage")
+                if u:
+                    usage["in"] += u.get("prompt_tokens", 0) or 0
+                    usage["out"] += u.get("completion_tokens", 0) or 0
+                choices = chunk.get("choices", [])
+                if not choices:
+                    continue
+                ch0 = choices[0]
+                if ch0.get("finish_reason"):
+                    finish = ch0["finish_reason"]
+                delta = ch0.get("delta", {}) or {}
+                content = delta.get("content")
+                if content:
+                    iter_text.append(content)
+                    text_parts.append(content)
+                    await on_delta(content)
+                for tc in delta.get("tool_calls") or []:
+                    idx = tc.get("index", 0)
+                    slot = frags.setdefault(idx, {"id": "", "name": "", "args": ""})
+                    if tc.get("id"):
+                        slot["id"] = tc["id"]
+                    fn = tc.get("function") or {}
+                    if fn.get("name"):
+                        slot["name"] = fn["name"]
+                    if fn.get("arguments"):
+                        slot["args"] += fn["arguments"]
+        return finish, frags, "".join(iter_text)
+
+    stop = "completed"
     try:
         async with httpx.AsyncClient(timeout=120) as client:
-            body: dict[str, Any] = {
-                "model": model,
-                "max_tokens": max_tok,
-                "stream": True,
-                "messages": [{"role": "system", "content": system}] + messages,
-            }
-            async with client.stream(
-                "POST",
-                f"{base_url}/chat/completions",
-                json=body,
-                headers={
-                    "Authorization": f"Bearer {key}",
-                    "Content-Type": "application/json",
-                },
-            ) as resp:
-                resp.raise_for_status()
-                async for line in resp.aiter_lines():
-                    if not line.startswith("data: "):
-                        continue
-                    data = line[6:].strip()
-                    if data == "[DONE]":
-                        break
+            concluded = not use_tools
+            for _ in range(iters if use_tools else 1):
+                if use_tools:
+                    _trim_tool_history(convo)
+                finish, frags, iter_text = await _once(client, use_tools)
+                if not use_tools or finish != "tool_calls" or not frags:
+                    stop = finish or "completed"
+                    concluded = True
+                    break
+                # Guard against malformed/leaked tool calls (e.g. DeepSeek spilling
+                # its ｜｜DSML｜｜ function-call markup as text → empty tool name).
+                # Executing those and looping is how the turn "hangs"; conclude instead.
+                ordered = [(i, frags[i]) for i in sorted(frags)
+                           if (frags[i].get("name") or "").strip()]
+                if not ordered:
+                    stop = "malformed_tool_call"
+                    concluded = True
+                    break
+                tool_calls = [{
+                    "id": slot["id"] or f"call_{i}",
+                    "type": "function",
+                    "function": {"name": slot["name"], "arguments": slot["args"] or "{}"},
+                } for i, slot in ordered]
+                convo.append({"role": "assistant",
+                              "content": iter_text or None, "tool_calls": tool_calls})
+                for (i, slot), call in zip(ordered, tool_calls):
                     try:
-                        chunk = json.loads(data)
-                        choices = chunk.get("choices", [])
-                        if not choices:
-                            # usage metadata chunk with no delta
-                            continue
-                        delta = choices[0].get("delta", {})
-                        content = delta.get("content", "")
-                        if content:
-                            text_parts.append(content)
-                            await on_delta(content)
+                        args = json.loads(slot["args"]) if slot["args"].strip() else {}
                     except json.JSONDecodeError:
-                        continue
-        return {"text": "".join(text_parts), "usage": {}, "stop_reason": "completed"}
+                        args = {}
+                    if not isinstance(args, dict):
+                        args = {}
+                    result = await on_tool(slot["name"], args, call["id"])
+                    convo.append({"role": "tool", "tool_call_id": call["id"],
+                                  "content": result})
+
+            # hit the tool-call budget without concluding → force ONE final answer
+            # with tools disabled, so the turn returns a real synthesis instead of
+            # an empty string (which makes the caller wastefully redo the work).
+            if use_tools and not concluded:
+                _trim_tool_history(convo, keep_last=6)
+                convo.append({"role": "user", "content":
+                              "（已达工具调用上限）请立即基于你已经查到的信息给出最终结论，"
+                              "不要再调用任何工具。"})
+                await _once(client, False)
+                stop = "concluded_after_cap"
+
+        return {"text": "".join(text_parts),
+                "usage": {"input_tokens": usage["in"], "output_tokens": usage["out"]},
+                "stop_reason": stop}
     except Exception as e:
         err = f"（调用 {model} 失败：{type(e).__name__}: {e}）"
         await on_delta("\n" + err)

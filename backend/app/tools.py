@@ -35,6 +35,9 @@ _DANGER = (
     "> /dev/sd", "chmod -r 000", "git push", "curl", "wget", "ssh ",
 )
 
+_REPO_MAP_MAX_FILES = 200
+_REPO_MAP_TREE_MAX = 300
+
 
 # ── tool schema (Anthropic tool-use format) ────────────────────────────────
 def tool_specs(allow: set[str] | None = None) -> list[dict[str, Any]]:
@@ -54,19 +57,30 @@ def tool_specs(allow: set[str] | None = None) -> list[dict[str, Any]]:
         },
         {
             "name": "read_file",
-            "description": "读取项目仓库里一个文件的内容（相对仓库根的路径）。",
+            "description": ("读取项目仓库里一个文件的内容（相对仓库根的路径）。单次最多返回约 8000 字符，"
+                            "过长会截断；用 offset（字符偏移）继续读取后续部分。"),
             "input_schema": {
                 "type": "object",
-                "properties": {"path": {"type": "string", "description": "相对仓库根的文件路径"}},
+                "properties": {
+                    "path": {"type": "string", "description": "相对仓库根的文件路径"},
+                    "offset": {"type": "integer",
+                               "description": "从第几个字符开始读，默认 0；文件被截断时用它读后续内容"},
+                },
                 "required": ["path"],
             },
         },
         {
             "name": "grep",
-            "description": "在项目仓库源码里全文搜索一个子串（不区分大小写），返回命中的文件、行号、行内容。",
+            "description": ("在项目仓库里用正则搜索（忽略大小写），返回命中的文件、行号、行内容。"
+                            "支持用 | 一次搜一族同义词，例如 "
+                            "`encrypt|decrypt|加密|解密|AES|cipher|secret|hmac|secure_link`。"
+                            "覆盖源码与常见配置/脚本文件（.env、nginx.conf、Dockerfile、.sql 等）。"
+                            "多项目群会搜索所有关联项目。命中或文件过多时会明确提示已截断——"
+                            "「未命中」只代表在已扫描范围内没找到，不等于不存在。"),
             "input_schema": {
                 "type": "object",
-                "properties": {"pattern": {"type": "string", "description": "要搜索的子串"}},
+                "properties": {"pattern": {"type": "string",
+                                           "description": "正则表达式；可用 | 表达多个关键词"}},
                 "required": ["pattern"],
             },
         },
@@ -90,6 +104,27 @@ def tool_specs(allow: set[str] | None = None) -> list[dict[str, Any]]:
                 "type": "object",
                 "properties": {"command": {"type": "string", "description": "要执行的 shell 命令"}},
                 "required": ["command"],
+            },
+        },
+        {
+            "name": "repo_map",
+            "description": "生成项目仓库的结构化地图：目录树、关键符号（函数/类）、入口点、依赖信息、构建命令、git 状态。在首次接触一个仓库时优先调用此工具了解全貌。",
+            "input_schema": {
+                "type": "object",
+                "properties": {},
+            },
+        },
+        {
+            "name": "explore",
+            "description": ("派发一个只读探查子代理，横扫整个仓库（含前端/后端/docs）调查一个问题，"
+                            "自动 repo_map+grep+read 后返回带文件定位的综合结论。"
+                            "适合「某功能怎么实现 / 有没有 X / 加解密怎么做」这类需要横扫多文件、"
+                            "跨前后端的问题——你只需给出清晰的问题，不用自己一个个翻文件。"),
+            "input_schema": {
+                "type": "object",
+                "properties": {"question": {"type": "string",
+                                            "description": "要调查的问题，越具体越好"}},
+                "required": ["question"],
             },
         },
     ]
@@ -116,6 +151,19 @@ class ToolContext:
             root = Path(p["local_path"]).resolve()
             if root.exists():
                 roots[pid] = root
+        default = next(iter(roots), None)
+        return cls(roots=roots, default_pid=default)
+
+    @classmethod
+    def for_agent(cls, project_ids: list[str], role: str) -> "ToolContext":
+        """Confine tools to each project's per-role independent clone, so this
+        agent's writes/commands are isolated from other agents on the same
+        project. Falls back to the shared checkout when there is no git repo."""
+        roots: dict[str, Path] = {}
+        for pid in project_ids:
+            root = projects.agent_root(pid, role)
+            if root and root.exists():
+                roots[pid] = root.resolve()
         default = next(iter(roots), None)
         return cls(roots=roots, default_pid=default)
 
@@ -147,13 +195,19 @@ def execute(name: str, args: dict[str, Any], ctx: ToolContext) -> str:
         if name == "list_dir":
             return _list_dir(args.get("path", "."), ctx)
         if name == "read_file":
-            return _read_file(args.get("path", ""), ctx)
+            return _read_file(args.get("path", ""), ctx, _int(args.get("offset")))
         if name == "grep":
             return _grep(args.get("pattern", ""), ctx)
+        if name == "repo_map":
+            return _repo_map(ctx)
         if name == "write_file":
             return _write_file(args.get("path", ""), args.get("content", ""), ctx)
         if name == "run_command":
             return _run_command(args.get("command", ""), ctx)
+        if name == "explore":
+            # explore is async (spawns a sub-agent); it is dispatched in chat.on_tool,
+            # never through this synchronous path. Reaching here means mis-wiring.
+            return "（explore 需由上层异步处理，未在此同步执行）"
         return f"（未知工具：{name}）"
     except Exception as e:  # never let a tool crash the agent turn
         return f"（工具 {name} 执行异常：{type(e).__name__}: {e}）"
@@ -171,6 +225,10 @@ def summarize(name: str, args: dict[str, Any]) -> str:
         return args.get("path", "")
     if name == "run_command":
         return args.get("command", "")
+    if name == "repo_map":
+        return "生成仓库地图"
+    if name == "explore":
+        return (args.get("question", "") or "")[:60]
     return ""
 
 
@@ -196,7 +254,14 @@ def _list_dir(rel: str, ctx: ToolContext) -> str:
     return f"{relshown}/ 下的条目：\n" + "\n".join(entries) if entries else f"{relshown}/ 为空"
 
 
-def _read_file(rel: str, ctx: ToolContext) -> str:
+def _int(v: Any) -> int:
+    try:
+        return max(0, int(v))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _read_file(rel: str, ctx: ToolContext, offset: int = 0) -> str:
     if not rel:
         return "（缺少 path 参数）"
     target = ctx._resolve(rel)
@@ -208,21 +273,385 @@ def _read_file(rel: str, ctx: ToolContext) -> str:
         text = target.read_text(encoding="utf-8", errors="replace")
     except OSError as e:
         return f"（读取失败：{e}）"
-    if len(text) > _READ_MAX:
-        text = text[:_READ_MAX] + "\n…（文件已截断）"
-    return text
+    total = len(text)
+    window = text[offset:offset + _READ_MAX]
+    end = offset + len(window)
+    if end < total:
+        window += (f"\n…（文件在此截断：共 {total} 字符，本次显示 {offset}~{end}；"
+                   f"如需后续内容，用 read_file(path='{rel}', offset={end}) 继续读取）")
+    elif offset:
+        window += f"\n…（已读到文件末尾，共 {total} 字符）"
+    return window
 
 
 def _grep(pattern: str, ctx: ToolContext) -> str:
     if not pattern:
         return "（缺少 pattern 参数）"
-    if not ctx.default_pid:
+    if not ctx.roots:
         return "（无可用项目仓库）"
-    hits = projects.grep_repo(ctx.default_pid, pattern, max_hits=_GREP_MAX)
-    if not hits:
-        return f"未命中「{pattern}」。"
-    lines = [f"{h['file']}:{h['line']}: {h['text']}" for h in hits]
-    return f"命中 {len(hits)} 处：\n" + "\n".join(lines)
+    # Search every project bound to the channel (not just the default one) — the
+    # answer may live in a sibling repo (e.g. an image-serving service). Each
+    # agent searches its own per-role worktree so its fresh writes are visible.
+    multi = len(ctx.roots) > 1
+    blocks: list[str] = []
+    for pid, root in ctx.roots.items():
+        res = projects.grep_repo(pid, pattern, max_hits=_GREP_MAX, root=root)
+        head = f"【项目 {pid}】" if multi else ""
+        notes: list[str] = []
+        if not res["regex_ok"]:
+            notes.append("注：该 pattern 作为正则无效，已按纯文本匹配。")
+        if not res["hits"]:
+            tail = (" " + " ".join(notes)) if notes else ""
+            blocks.append(f"{head}未命中「{pattern}」"
+                          f"（已扫描 {res['files_scanned']} 个文件）。{tail}")
+            continue
+        lines = [f"{h['file']}:{h['line']}: {h['text']}" for h in res["hits"]]
+        if res["truncated_hits"]:
+            notes.append(f"⚠️ 命中已达上限 {_GREP_MAX} 条，可能还有更多——请缩小或精确化查询后再搜。")
+        if res["truncated_files"]:
+            notes.append("⚠️ 仓库文件过多、扫描已截断，部分目录可能未覆盖——建议按子目录分别搜索。")
+        body = f"{head}命中 {len(res['hits'])} 处（扫描 {res['files_scanned']} 个文件）：\n" + "\n".join(lines)
+        if notes:
+            body += "\n" + "\n".join(notes)
+        blocks.append(body)
+    return "\n\n".join(blocks)
+
+
+def _repo_map(ctx: ToolContext) -> str:
+    """Generate a structured codebase map: tree + symbols + entry points + deps + git status."""
+    import re, json
+    root = ctx._root()
+    if root is None:
+        return "（无可用项目仓库）"
+    pid = ctx.default_pid
+    p = projects.get_project(pid) if pid else {}
+    lines: list[str] = []
+    lines.append(f"# 仓库地图: {p.get('name', root.name)}")
+    if p.get("repo_url"):
+        lines.append(f"远程: {p['repo_url']}  |  分支: {p.get('branch', '?')}")
+    lines.append("")
+
+    # 1. Directory tree
+    lines.append("## 目录树")
+    lines.extend(_build_tree(root))
+    lines.append("")
+
+    # 2. Entry points
+    lines.append("## 入口点")
+    eps = _find_entry_points(root)
+    lines.extend(eps if eps else ["（未识别到标准入口文件）"])
+    lines.append("")
+
+    # 3. Dependencies
+    lines.append("## 依赖信息")
+    deps = _extract_deps(root)
+    lines.extend(deps if deps else ["（未找到依赖清单文件）"])
+    lines.append("")
+
+    # 4. Build / test commands
+    lines.append("## 构建 / 测试命令")
+    cmds = _extract_commands(root)
+    lines.extend(cmds if cmds else ["（未找到构建或测试脚本）"])
+    lines.append("")
+
+    # 5. Key symbols (capped)
+    lines.append("## 关键符号")
+    syms = _extract_symbols(root)
+    lines.extend(syms)
+    lines.append("")
+
+    # 6. Git status
+    lines.append("## Git 状态")
+    git_lines = _git_status(root)
+    lines.extend(git_lines)
+
+    return "\n".join(lines)
+
+
+# ── repo_map helpers ──────────────────────────────────────────────────────
+
+def _build_tree(root: Path) -> list[str]:
+    """Indented directory tree from _walk_files output."""
+    entries: list[tuple[str, bool]] = []  # (rel_path, is_dir)
+    seen_dirs: set[str] = set()
+    for f in projects._walk_files(root, _REPO_MAP_TREE_MAX):
+        rel = str(f.relative_to(root)).replace("\\", "/")
+        parent = str(f.parent.relative_to(root)).replace("\\", "/") if f.parent != root else ""
+        # ensure all parent dirs are recorded
+        if parent and parent != ".":
+            parts = parent.split("/")
+            for i in range(len(parts)):
+                d = "/".join(parts[:i+1])
+                if d not in seen_dirs:
+                    seen_dirs.add(d)
+                    entries.append((d, True))
+        entries.append((rel, False))
+    if len(entries) >= _REPO_MAP_TREE_MAX:
+        entries.append(("…（已截断）", False))
+    # format with indentation
+    out: list[str] = []
+    for path, is_dir in entries:
+        depth = path.count("/")
+        name = path.rsplit("/", 1)[-1] if "/" in path else path
+        prefix = "  " * depth + ("📁 " if is_dir else "📄 ")
+        out.append(f"{prefix}{name}")
+    return out
+
+
+def _find_entry_points(root: Path) -> list[str]:
+    """Check for common entry-point files."""
+    checks = [
+        ("main.go", "Go 入口"), ("app.py", "Python 入口"), ("main.py", "Python 入口"),
+        ("run.py", "Python 入口"), ("index.ts", "TS 入口"), ("index.tsx", "React 入口"),
+        ("index.js", "JS 入口"), ("index.jsx", "React 入口"), ("main.rs", "Rust 入口"),
+        ("lib.rs", "Rust 库根"), ("Dockerfile", "容器入口"),
+        ("docker-compose.yml", "容器编排"), ("docker-compose.yaml", "容器编排"),
+        ("Makefile", "构建入口"), ("package.json", "Node 项目根"),
+        ("setup.py", "Python 项目根"), ("pyproject.toml", "Python 项目根"),
+        ("go.mod", "Go 项目根"), ("Cargo.toml", "Rust 项目根"),
+    ]
+    found: list[str] = []
+    for filename, label in checks:
+        if (root / filename).exists():
+            found.append(f"- {filename} ({label})")
+    return found
+
+
+def _extract_deps(root: Path) -> list[str]:
+    """Parse dependency manifests for top-level info."""
+    import json
+    out: list[str] = []
+    # package.json
+    pj = root / "package.json"
+    if pj.exists():
+        try:
+            data = json.loads(pj.read_text(encoding="utf-8"))
+            name = data.get("name", "?")
+            ver = data.get("version", "?")
+            deps = len(data.get("dependencies", {}))
+            dev = len(data.get("devDependencies", {}))
+            out.append(f"- package.json: {name}@{ver}, {deps} 生产依赖, {dev} 开发依赖")
+        except Exception:
+            out.append("- package.json（解析失败）")
+    # requirements.txt
+    rt = root / "requirements.txt"
+    if rt.exists():
+        try:
+            count = sum(1 for l in rt.read_text(encoding="utf-8").splitlines()
+                       if l.strip() and not l.strip().startswith("#"))
+            out.append(f"- requirements.txt: {count} 个依赖")
+        except Exception:
+            pass
+    # go.mod
+    gm = root / "go.mod"
+    if gm.exists():
+        try:
+            text = gm.read_text(encoding="utf-8")
+            mod = ""
+            m = __import__("re").search(r'^module\s+(\S+)', text, __import__("re").MULTILINE)
+            if m: mod = m.group(1)
+            reqs = len(__import__("re").findall(r'^\s*require\s+', text, __import__("re").MULTILINE))
+            out.append(f"- go.mod: module {mod}, {reqs} 个 require")
+        except Exception:
+            out.append("- go.mod")
+    # Cargo.toml
+    ct = root / "Cargo.toml"
+    if ct.exists():
+        try:
+            text = ct.read_text(encoding="utf-8")
+            m = __import__("re").search(r'^name\s*=\s*"(\S+)"', text, __import__("re").MULTILINE)
+            name = m.group(1) if m else "?"
+            deps = len(__import__("re").findall(r'^\[dependencies\]', text, __import__("re").MULTILINE))
+            out.append(f"- Cargo.toml: {name}, 含 [dependencies]")
+        except Exception:
+            out.append("- Cargo.toml")
+    # pyproject.toml
+    ppt = root / "pyproject.toml"
+    if ppt.exists():
+        out.append("- pyproject.toml（Python 项目配置）")
+    # Gemfile
+    if (root / "Gemfile").exists():
+        out.append("- Gemfile（Ruby 依赖）")
+    # pom.xml / build.gradle
+    if (root / "pom.xml").exists():
+        out.append("- pom.xml（Maven 项目）")
+    if (root / "build.gradle").exists() or (root / "build.gradle.kts").exists():
+        out.append("- build.gradle（Gradle 项目）")
+    return out
+
+
+def _extract_commands(root: Path) -> list[str]:
+    """Extract build/test commands from Makefile and package.json."""
+    import json
+    out: list[str] = []
+    # Makefile
+    mf = root / "Makefile"
+    if mf.exists():
+        try:
+            text = mf.read_text(encoding="utf-8")
+            targets = set(__import__("re").findall(r'^([a-zA-Z_][a-zA-Z0-9_.-]*):', text, __import__("re").MULTILINE))
+            notable = targets & {"build", "test", "run", "install", "deploy", "lint", "fmt", "clean", "dev", "start"}
+            if notable:
+                out.append(f"- make {' / make '.join(sorted(notable))}")
+        except Exception:
+            pass
+    # package.json scripts
+    pj = root / "package.json"
+    if pj.exists():
+        try:
+            data = json.loads(pj.read_text(encoding="utf-8"))
+            scripts = data.get("scripts", {})
+            notable = {k: v for k, v in scripts.items() if k in {"build", "test", "dev", "start", "lint", "format", "deploy", "serve"}}
+            if notable:
+                cmds = " / ".join(f"npm run {k}" for k in sorted(notable))
+                out.append(f"- {cmds}")
+        except Exception:
+            pass
+    # CI configs
+    gh_workflows = root / ".github" / "workflows"
+    if gh_workflows.exists():
+        try:
+            wfs = list(gh_workflows.glob("*.yml")) + list(gh_workflows.glob("*.yaml"))
+            if wfs:
+                names = [w.stem for w in wfs]
+                out.append(f"- GitHub Actions: {', '.join(names)}")
+        except Exception:
+            pass
+    if not out:
+        # fallback: note config files found
+        for f in ("pytest.ini", "tox.ini", "jest.config.js", "jest.config.ts",
+                  "vitest.config.ts", "vitest.config.js", ".gitlab-ci.yml"):
+            if (root / f).exists():
+                out.append(f"- 测试/CI 配置: {f}")
+    return out
+
+
+def _extract_symbols(root: Path) -> list[str]:
+    """Walk source files and extract key symbols (def/class/func/export) by language regex."""
+    import re
+    # Language-specific patterns: (extensions, [(pattern, kind), ...])
+    PATTERNS: dict[str, tuple[list[str], list[tuple[str, str]]]] = {
+        "py": (["py"], [
+            (r'^\s*(async\s+)?def\s+(\w+)', "def"),
+            (r'^\s*class\s+(\w+)', "class"),
+        ]),
+        "go": (["go"], [
+            (r'^func\s+(?:\([^)]*\)\s+)?(\w+)', "func"),
+            (r'^type\s+(\w+)', "type"),
+        ]),
+        "ts": (["ts", "tsx", "js", "jsx", "mjs", "cjs"], [
+            (r'^(?:export\s+)?(?:async\s+)?function\s+(\w+)', "fn"),
+            (r'^(?:export\s+)?class\s+(\w+)', "class"),
+            (r'^(?:export\s+)?(?:const|let|var)\s+(\w+)', "var"),
+            (r'^(?:export\s+)?(?:interface|type)\s+(\w+)', "type"),
+        ]),
+        "rs": (["rs"], [
+            (r'^\s*(?:pub(?:\s*\(\s*crate\s*\))?\s+)?fn\s+(\w+)', "fn"),
+            (r'^\s*(?:pub\s+)?struct\s+(\w+)', "struct"),
+            (r'^\s*(?:pub\s+)?enum\s+(\w+)', "enum"),
+            (r'^\s*(?:pub\s+)?trait\s+(\w+)', "trait"),
+        ]),
+        "java": (["java"], [
+            (r'^\s*(?:public\s+)?(?:abstract\s+)?(?:static\s+)?(?:final\s+)?(?:class|interface|enum)\s+(\w+)', "class"),
+        ]),
+    }
+
+    # Build ext->pattern_list index
+    ext_map: dict[str, list[tuple[str, str]]] = {}
+    for lang_cfg in PATTERNS.values():
+        exts, pats = lang_cfg
+        for ext in exts:
+            ext_map[ext] = pats
+
+    # Walk files
+    results: list[tuple[str, str, list[str]]] = []  # (dir_group, rel_path, [symbol_str])
+    total_syms = 0
+    files_scanned = 0
+    for f in projects._walk_files(root, _REPO_MAP_MAX_FILES):
+        if files_scanned >= _REPO_MAP_MAX_FILES:
+            break
+        ext = f.suffix.lstrip(".").lower()
+        if ext not in ext_map:
+            continue
+        if ext not in projects._SRC_EXTS and f.suffix.lower() not in projects._SRC_EXTS:
+            continue
+        files_scanned += 1
+        try:
+            text = f.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        pats = ext_map[ext]
+        syms: list[str] = []
+        for line in text.splitlines()[:400]:  # only scan top 400 lines per file
+            for pat, kind in pats:
+                m = re.search(pat, line)
+                if m:
+                    syms.append(f"{kind} {m.group(2) if m.lastindex >= 2 else m.group(1)}")
+                    if len(syms) >= 30:
+                        break
+            if len(syms) >= 30:
+                syms.append("…")
+                break
+        if not syms:
+            continue
+        rel = str(f.relative_to(root)).replace("\\", "/")
+        # group by top-level dir
+        parts = rel.split("/")
+        group = parts[0] if len(parts) > 1 else "（根目录）"
+        results.append((group, rel, syms))
+        total_syms += len(syms)
+        if total_syms >= 500:
+            break
+
+    if not results:
+        return ["（未找到可解析的源文件符号）"]
+
+    # Group by directory
+    from collections import defaultdict
+    grouped: dict[str, list[tuple[str, list[str]]]] = defaultdict(list)
+    for group, rel, syms in results:
+        grouped[group].append((rel, syms))
+
+    out: list[str] = []
+    for grp in sorted(grouped.keys()):
+        out.append(f"\n### {grp}/")
+        for rel, syms in grouped[grp]:
+            sym_str = ", ".join(syms[:25])
+            out.append(f"  {rel}: {sym_str}")
+    out.append(f"\n（共扫描 {files_scanned} 个源文件，提取 {total_syms} 个符号）")
+    return out
+
+
+def _git_status(root: Path) -> list[str]:
+    """Run git commands to get branch, status, recent log."""
+    out: list[str] = []
+    try:
+        branch = projects._git(str(root), "branch", "--show-current")
+        out.append(f"- 当前分支: {branch[1].strip() if branch[0] == 0 else '?'}")
+    except Exception:
+        out.append("- 当前分支: ?")
+    try:
+        status = projects._git(str(root), "status", "--short")
+        if status[0] == 0 and status[1].strip():
+            lines = status[1].strip().split("\n")[:15]
+            out.append("- 工作区状态:")
+            for l in lines:
+                out.append(f"  {l}")
+        elif status[0] != 0:
+            out.append("- 工作区: （无法获取）")
+        else:
+            out.append("- 工作区: 干净")
+    except Exception:
+        out.append("- 工作区: （git 不可用）")
+    try:
+        log = projects._git(str(root), "log", "--oneline", "-5")
+        if log[0] == 0 and log[1].strip():
+            out.append("- 最近提交:")
+            for l in log[1].strip().split("\n")[:5]:
+                out.append(f"  {l}")
+    except Exception:
+        pass
+    return out
 
 
 def _write_file(rel: str, content: str, ctx: ToolContext) -> str:

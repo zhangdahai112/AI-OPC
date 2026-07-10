@@ -8,6 +8,7 @@ data/*.log
 data/*.json
 data/memory/
 workspaces/
+agent_repos/
 .DS_Store
 node_modules/
 # local / build caches

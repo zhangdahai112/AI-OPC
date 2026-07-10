@@ -24,6 +24,21 @@ except Exception:
 # under config["llm"]["providers"][].  The env-var-override below is for
 # backward-compat when the DB hasn't been seeded yet.
 LLM_MAX_TOKENS = int(os.environ.get("WARROOM_MAX_TOKENS", "4096"))
+# Tool-use loop: max model<->tool round-trips per agent turn. Deep investigations
+# (repo_map → many grep/read) routinely need >12, so default generously.
+LLM_MAX_TOOL_ITERS = int(os.environ.get("WARROOM_MAX_TOOL_ITERS", "24"))
+# Hard ceiling on tokens generated per single model call — the model's max output
+# (128K on current Claude/Opus-tier models). Streaming is always on, so large
+# ceilings don't hit HTTP timeouts. NOTE: the effective per-call limit is
+# min(this, provider.max_tokens); a provider configured with an absurd value
+# (e.g. 111111) will now use that value again rather than being clamped down —
+# fix the provider's max_tokens in 「配置 → LLM 供应商」 to a sane cap if needed.
+LLM_MAX_TOKENS_CEILING = int(os.environ.get("WARROOM_MAX_TOKENS_CEILING", "131072"))
+# Default output budget for a normal agent reply, passed explicitly so a turn does
+# NOT inherit a misconfigured provider.max_tokens (e.g. 111111). Plenty for an
+# answer + tool-call args; the 128K ceiling above still applies when a caller
+# explicitly asks for more.
+LLM_ANSWER_MAX_TOKENS = int(os.environ.get("WARROOM_ANSWER_MAX_TOKENS", "16384"))
 
 
 def has_api_key() -> bool:
@@ -32,11 +47,15 @@ def has_api_key() -> bool:
 
 DATA_DIR = Path(os.environ.get("WARROOM_DATA", ROOT / "data"))
 WORKSPACES_DIR = Path(os.environ.get("WARROOM_WORKSPACES", ROOT / "workspaces"))
+# Each agent role gets its OWN independent clone here: agent_repos/<pid>/<role>.
+# These are separate git repos (own .git/history), not worktrees or submodules of
+# the base checkout, so agents on the same project are mutually independent.
+AGENT_REPOS_DIR = Path(os.environ.get("WARROOM_AGENT_REPOS", ROOT / "agent_repos"))
 MEMORY_DIR = Path(os.environ.get("WARROOM_MEMORY", DATA_DIR / "memory"))
 WEB_DIR = ROOT / "web"
 DB_PATH = DATA_DIR / "warroom.db"
 
-for _p in (DATA_DIR, WORKSPACES_DIR, MEMORY_DIR):
+for _p in (DATA_DIR, WORKSPACES_DIR, AGENT_REPOS_DIR, MEMORY_DIR):
     _p.mkdir(parents=True, exist_ok=True)
 
 # Memory scopes (PRD FR-8.1 / arch 3.6): channel < agent < project < history < permanent
