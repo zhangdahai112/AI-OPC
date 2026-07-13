@@ -18,14 +18,21 @@ from typing import Awaitable, Callable
 from . import llm, projects, tools
 
 # read-only surface for the explorer (deliberately excludes explore/write/run)
-_READONLY = {"list_dir", "read_file", "grep", "repo_map"}
+_READONLY = {"list_dir", "read_file", "grep", "find_symbol", "repo_map"}
 
 OnSubTool = Callable[[str, dict, str], Awaitable[None]]
 
 EXPLORER_SYSTEM = (
     "你是一个只读的代码探查子代理（类似 Explore）。你的唯一任务：针对给定问题，"
     "横扫整个仓库把答案调查清楚，然后给出一份带文件定位（file:line 或 文件+函数名）的综合结论。\n"
-    "你有只读工具：repo_map / list_dir / read_file / grep。你不能改文件、不能跑命令、不能再派子代理。\n"
+    "你有只读工具：repo_map / list_dir / read_file / grep / find_symbol。"
+    "你不能改文件、不能跑命令、不能再派子代理。\n"
+    "\n【追链而非概览——核心工作方式】\n"
+    "别只 grep 一遍关键词就下结论。要顺着调用链一步步追：从入口（路由/接口）出发，"
+    "用 **find_symbol(名字)** 跳到被调函数的定义、并看它被谁调用，逐跳 read 打开，"
+    "一直追到真正的实现——**包括异步/队列那一跳**（提交 → celery task/poll → 写结果 → "
+    "序列化返回）。加解密/改写常发生在**序列化/返回层**（response_model、`*_out()`、"
+    "schema 的 model_validator），必须追到那里，不能停在路由或 service 中间。\n"
     "\n【调查方法论——必须遵守】\n"
     "1. 先复述问题的真实意图并主动放宽范围：能力常不在名字最直白的那条路径上"
     "（例如「图片上传怎么加密」真正的加解密可能在输出/下发/前端，而不在上传函数里）。\n"

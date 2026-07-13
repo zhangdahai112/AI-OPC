@@ -71,6 +71,19 @@ function CrewSection({ members, channelId }: { members: any[]; channelId: string
 }
 
 function ProjectsSection({ projects, channelId }: { projects: any[]; channelId: string }) {
+  const [reviewing, setReviewing] = useState(false);
+
+  const handleReview = async () => {
+    setReviewing(true);
+    try {
+      await api.requestReview(channelId);
+    } catch {
+      /* errors surface as a system card over SSE */
+    } finally {
+      setReviewing(false);
+    }
+  };
+
   return (
     <div className="ctxsec">
       <div className="ctxhd">关联项目 <span style={{ fontWeight: 400, color: "var(--tx3)" }}>{projects.length} 个</span></div>
@@ -82,6 +95,17 @@ function ProjectsSection({ projects, channelId }: { projects: any[]; channelId: 
       ))}
       {projects.length === 0 && (
         <div style={{ fontSize: 12, color: "var(--tx3)" }}>暂无关联项目</div>
+      )}
+      {projects.length > 0 && (
+        <button
+          className="btn"
+          style={{ marginTop: 10, width: "100%", padding: "8px 11px" }}
+          disabled={reviewing}
+          onClick={handleReview}
+          title="对开发的当前改动跑真实验收门禁（构建 · 测试 · 策略）"
+        >
+          {reviewing ? "验收中…" : "申请验收"}
+        </button>
       )}
     </div>
   );

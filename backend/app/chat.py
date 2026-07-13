@@ -8,33 +8,16 @@ from __future__ import annotations
 
 import asyncio
 
-from . import (agents, channels, db, events, explorer, llm, mcp, projects,
-               skill_store, tools)
+from . import (agents, channels, db, events, explorer, gates, llm, mcp, projects,
+               prompts, skill_store, tools)
 from .config import LLM_ANSWER_MAX_TOKENS
 from .engine import ROLE_CN, get_ticket, post as engine_post, _set_roster_state
 
 ROLE_KEYS = list(ROLE_CN.keys())
 
-# Per-role investigation lens — the shared mechanics (grep/explore/methodology) are
-# role-agnostic; what differs is *what* each role investigates for. A single line
-# per role, appended to the shared methodology. Overridable per (project,role) via
-# manifest["prompt"]["investigationLens"] — this map is only the platform default.
-_ROLE_INVESTIGATION_LENS = {
-    "analyst": "你的调查侧重：摸清架构、数据流、入口与需求符合度——广度优先；"
-               "遇到跨前后端/多文件的问题优先用 explore 一次铺开。",
-    "developer": "你的调查侧重：精准定位要改的代码，并在动手前评估影响面"
-                 "（调用方、依赖、blast radius），避免改一处漏一片。",
-    "tester": "你的调查侧重：定位可测点与复现路径，核查现有测试覆盖与运行方式"
-              "（怎么跑、跑哪些），再决定补什么测试。",
-    "devops": "你的调查侧重：配置/部署/CI 相关——Dockerfile、nginx、.env、流水线、"
-              "密钥与出网，优先搜这些配置与脚本文件。",
-    "reporter": "你的调查侧重：只读地摸清高层现状与结论，做简洁汇总，"
-                "不深挖实现细节、不改动仓库。",
-}
-
 # read-only tools whose identical repeats can be safely short-circuited within a
 # turn; mutating tools invalidate that cache (files may have changed).
-_CACHEABLE_TOOLS = {"read_file", "grep", "list_dir", "repo_map", "explore"}
+_CACHEABLE_TOOLS = {"read_file", "grep", "find_symbol", "list_dir", "repo_map", "explore"}
 _MUTATING_TOOLS = {"write_file", "run_command"}
 
 
@@ -62,164 +45,51 @@ def _sanitize_answer(text: str) -> str:
     return _CTRL_GARBAGE.sub("", text).strip()
 
 
-def _harness_text(tools_enabled: set[str]) -> str:
-    """The tool-use instructions, restricted to the tools this agent actually
-    holds (least privilege). A read-only agent is told so explicitly rather than
-    being handed write/run instructions it can't execute."""
-    # coordinator has zero tools — it only routes & manages
-    if not tools_enabled:
-        return (
-            "\n【你是纯管控角色，没有操作工具】\n"
-            "- 你无权访问代码仓库、不能读文件、不能搜索代码、不能写文件、不能跑命令。\n"
-            "- 你的职责是分析需求、拆解任务、按角色分派给群里其他成员来执行。\n"
-            "- 需要具体技术动作时，用「@角色key」（如 @developer、@tester、@devops）明确点名转交。\n"
-            "- 汇总各成员的产出，向人类汇报进度与决策点，但不要替他们干活。")
-    lines = ["\n【你有真实工具，必须实际使用，不要凭空臆测代码】"]
-    if tools_enabled & {"list_dir", "read_file", "grep", "repo_map"}:
-        lines.append("- repo_map：生成仓库结构地图（目录树、入口、依赖、符号），"
-                     "在首次接触一个仓库时优先调用；不要一上来就凭文件名猜测。")
-        lines.append("- list_dir / read_file / grep：查看具体目录/文件/搜索；"
-                     "回答涉及代码前，先用它们核实，不要编造文件名或实现。"
-                     "read_file 过长会截断，用 offset 继续读完，别只看开头就下结论。")
-        lines.append(
-            "\n【调查纪律 — 避免「搜不到 = 不存在」的误判】\n"
-            "- grep 是正则、忽略大小写：判断「有没有某能力」时，一次搜一族同义词，"
-            "例如加解密可搜 "
-            "`encrypt|decrypt|加密|解密|AES|cipher|secret|salt|sign|hmac|hashlib|"
-            "Fernet|Crypto|xor|scramble|watermark|secure_link|防盗链`。\n"
-            "- 数据要双向追踪：既看写入/上传/落盘路径，也看读取/下发/下载/serve 路径——"
-            "「解密」通常发生在读取侧，只看上传路径会漏。\n"
-            "- 工具回传的「未命中 / 已截断」只代表在你已扫描的范围内，绝不等于「不存在」。"
-            "要下「没有 X」这种结论前，必须正向定位到具体代码，或如实说明你到底搜了哪些"
-            "目录/文件、还有哪些没覆盖。绝不能把「我没搜到」偷换成「系统里没有」。")
-    if "write_file" in tools_enabled:
-        lines.append("- write_file：按你的职责真正修改/新增文件。")
-    if "run_command" in tools_enabled:
-        lines.append("- run_command：在仓库目录跑命令（测试 pytest/npm test、"
-                     "git status/diff/add/commit、构建等）。")
-    if tools_enabled & {"write_file", "run_command"}:
-        lines.append("先调研（读/搜），再动手（写/跑），最后用 git diff/status 自查并简述"
-                     "你改了什么、验证结果如何。涉及上线/删除/改库等不可逆动作时先说明并"
-                     "请求人类确认，不要擅自执行。")
-    else:
-        lines.append("你当前是只读权限：只做调研与建议，不直接改仓库；"
-                     "需要改动时用「@角色key」点名有写权限的成员来执行。")
-    return "\n".join(lines)
-
-
 # ---- system prompt assembly --------------------------------------------
 def assemble_system(cid_or_tid: str, role: str, manifest: dict,
                     *, is_channel: bool = False) -> str:
-    """Build the agent's system prompt from its resolved manifest.
+    """Resolve the scope (channel/ticket) into an immutable ``PromptContext`` and
+    render it through the declarative section pipeline in :mod:`prompts`.
 
-    Ordered cold→hot for prompt-cache stability: stable identity / guardrails /
-    harness first, then the semi-stable project grounding and member list.
+    This is the thin I/O adapter: it does the db/git lookups (members, project
+    grounding, skill index) and hands pure data to the pure renderers. All prompt
+    *content* and section ordering live in :mod:`prompts`.
     """
     if is_channel:
         ch = channels.get_channel(cid_or_tid)
         project_ids = [p["project_id"] for p in ch.get("projects", []) if p.get("project_id")]
-        name = ch.get("name", "群聊")
+        scope_name = ch.get("name", "群聊")
         members = ch.get("members", [])
     else:
         t = get_ticket(cid_or_tid)
         project_ids = [t.get("project_id")] if t.get("project_id") else []
-        name = t.get("title", "工单")
+        scope_name = t.get("title", "工单")
         members = t.get("roster", [])
 
-    ident = manifest.get("identity", {})
-    parts: list[str] = []
-    parts.append(
-        f"你是一名 AI {ident.get('name', ROLE_CN.get(role, role))}（角色 key: {role}），"
-        f"在一个多 agent 协作「群聊」里与人类操作员和其他 agent 一起工作。当前群：{name}。")
-    if ident.get("focus"):
-        parts.append(f"你的职责聚焦：{ident['focus']}。")
-
-    guardrails = manifest.get("prompt", {}).get("guardrails") or []
-    if guardrails:
-        parts.append("\n【你的质量红线】\n" + "\n".join(f"- {g}" for g in guardrails))
-
-    tools_enabled = set(manifest.get("harness", {}).get("builtinTools", []))
-    if project_ids:
-        parts.append(_harness_text(tools_enabled))
-
-    # progressive-disclosure index of installed skills (name + when_to_use)
-    skill_index = skill_store.system_index(manifest.get("skills", []) or [])
-    if skill_index:
-        parts.append(f"\n【可用技能】\n{skill_index}")
-
+    # resolve per-project grounding (docs / permanent memory / repo context)
+    grounding: list[dict] = []
     for pid in project_ids:
         proj = projects.get_project(pid) if pid else None
-        if proj:
-            parts.append(f"\n【项目】{proj['name']}")
-            if proj.get("docs"):
-                parts.append(f"【需求文档】\n{proj['docs'][:4000]}")
-            mem = projects.get_agent_memory(pid, role)
-            if mem:
-                parts.append(f"\n【你的永久记忆 / 本项目专属知识】\n{mem}")
-            ctx = projects.repo_context(pid, role=role)
-            if ctx:
-                parts.append(f"\n【代码库上下文】\n{ctx}")
+        if not proj:
+            continue
+        grounding.append({
+            "name": proj["name"],
+            "docs": (proj.get("docs") or "")[:4000],
+            "memory": projects.get_agent_memory(pid, role) or "",
+            "repo_context": projects.repo_context(pid, role=role) or "",
+        })
 
-    others = [(r["role"], ROLE_CN.get(r["role"], r["role"]))
-              for r in members if r.get("role") != role]
-    if others:
-        listing = "、".join(f"{cn}（@{key}）" for key, cn in others)
-        parts.append(f"\n群里的其他成员：{listing}。")
-
-    parts.append(
-        "\n协作规则：只做你这个角色该做的事。遇到不属于你职责的问题，"
-        "用「@角色key」（例如 @developer、@tester）明确点名转交给对应成员，"
-        "被点名的成员会自动接力回复。不要臆测，不要替别人完成工作。"
-        "回答要具体、可落地、简洁。涉及上线/改库/删除/权限等不可逆动作时，"
-        "提示需要人类审批。用中文回答。")
-
-    if tools_enabled:
-        parts.append(
-            "\n⚠️ 去锚定：上文中其他成员（含项目经理）的结论只是线索，不是已证实的事实。"
-            "涉及事实判断（有没有、是不是、在哪里），必须自己用工具复核到具体代码再表态；"
-            "不要因为别人先说了某个结论就顺着确认。你可以、且应该推翻错误的转述。")
-        parts.append(
-            "\n【调查方法论 — 先规划再动手，别只追字面路径】\n"
-            "1. 先复述用户的真实意图，并主动放宽范围：把「X上传怎么加密」理解成"
-            "「这个系统用密码学怎么处理 X」——能力常常不在名字最直白的那条路径上。\n"
-            "2. 动手搜之前，先列出跨层候选位置逐一排查：前端(src/utils、components)、"
-            "后端接口(api/openapi)、service、utils、模型、docs 设计文档、配置(.env/nginx)；"
-            "别只盯一个目录。\n"
-            "3. 按「能力的词汇」搜，而不是问题里的名词：查加解密就搜 "
-            "encrypt|decrypt|加密|解密|AES|cipher|bng|防盗链|sign|secure_link|crypto，"
-            "而不是只搜 upload/图片上传。\n"
-            "4. 数据要覆盖两个方向：输入/上传 与 输出/下发/serve/前端渲染——"
-            "很多加密/解密只在输出侧或前端。\n"
-            "5. 下关键结论前先扫 docs/README/设计文档，那里常直接写着方案入口。\n"
-            "6. 一条路径没有 X ≠ 整个系统没有 X：证明「上传路径传明文」不等于「系统不加密」。"
-            "下否定结论前，必须已覆盖上面所有层，否则只能说「在我查过的 X 范围内没有」。\n"
-            "7. 省 token：工具调用要吝啬——先 grep 定位、再只读必要文件一次，"
-            "不要重复读同一个文件或重复搜同一个词（重复调用会被系统拦截并提示）；"
-            "遇到需要横扫多文件/跨前后端的问题，优先用 explore 交给探查子代理一次搞定，"
-            "**并信任它返回的结论，不要自己再手动重扫一遍**；拿到足够信息就停手给结论。")
-        # role-specific investigation lens (manifest override → platform default)
-        lens = (manifest.get("prompt", {}).get("investigationLens")
-                or _ROLE_INVESTIGATION_LENS.get(role))
-        if lens:
-            parts.append("\n" + lens)
-
-    # coordinator-specific routing mandate
-    if role == "coordinator":
-        parts.append(
-            "\n⚠️ 你是项目经理，不是执行者。你的工作方式：\n"
-            "1. 收到人类指令后，先拆解成可分配给不同角色的子任务。\n"
-            "2. 用「@角色key」将每个子任务点名指派给对应的专业 agent。\n"
-            "3. 等他们各自回复后，汇总结果并向人类汇报。\n"
-            "4. 遇到阻塞或需要决策时，升级给人类操作员而不是自己动手。\n"
-            "❌ 禁止：亲自读代码、亲自写代码、亲自跑命令、亲自做测试——"
-            "这些全是其他成员的工作，你做就是越权。\n"
-            "\n"
-            "📋 收到任务后的标准探索流程：\n"
-            "1. 先用 @analyst 调用 repo_map 了解仓库全局结构\n"
-            "2. 让 @analyst 读入口文件理解主流程\n"
-            "3. 让 @analyst 用 grep 搜关键概念定位相关模块\n"
-            "4. 形成方案后，@对应角色执行具体任务")
-    return "\n".join(parts)
+    ctx = prompts.PromptContext(
+        role=role,
+        manifest=manifest,
+        scope_name=scope_name,
+        member_roles=tuple(r["role"] for r in members if r.get("role") != role),
+        project_ids=tuple(project_ids),
+        tools=frozenset(manifest.get("harness", {}).get("builtinTools", [])),
+        grounding=tuple(grounding),
+        skills_index=skill_store.system_index(manifest.get("skills", []) or []) or "",
+    )
+    return prompts.build_system(ctx)
 
 
 def _transcript(cid_or_tid: str, *, is_channel: bool = False, limit: int = 30) -> str:
@@ -353,6 +223,21 @@ async def agent_reply(cid_or_tid: str, role: str, *, is_channel: bool = False) -
              f"\n\n请以「{ROLE_CN[role]}」身份回复最新消息。"}]
 
     acc: list[str] = []
+    # Ordered timeline of the turn: text segments interleaved with tool calls in
+    # the exact order they happened, so the UI can render the model's narration
+    # and its tool use nested together (think→verify→conclude) instead of stacking
+    # "all tools, then all text". html/toolCalls are still kept for back-compat.
+    steps: list[dict] = []
+    _flushed = 0  # chars of "".join(acc) already emitted as a text step
+
+    def _flush_text() -> None:
+        """Turn text accumulated since the last flush into a timeline text step."""
+        nonlocal _flushed
+        joined = "".join(acc)
+        seg = _sanitize_answer(joined[_flushed:])
+        _flushed = len(joined)
+        if seg:
+            steps.append({"type": "text", "text": seg})
 
     async def on_delta(text: str):
         acc.append(text)
@@ -366,8 +251,14 @@ async def agent_reply(cid_or_tid: str, role: str, *, is_channel: bool = False) -
     mcp_mounts = manifest.get("mcp", []) or []
     mcp_specs = mcp.tool_specs(mcp_mounts)
 
-    builtin_specs = tools.tool_specs(allow=agents.allowed_tools(manifest)) if ctx.has_repo else None
-    tool_specs = (builtin_specs or []) + mcp_specs
+    allowed = agents.allowed_tools(manifest)
+    if ctx.has_repo:
+        builtin_specs = tools.tool_specs(allow=allowed)
+    else:
+        # no writable project yet — still expose create_project so an agent can
+        # scaffold one (then write into it) instead of just describing it.
+        builtin_specs = tools.tool_specs(allow=allowed & {"create_project"})
+    tool_specs = builtin_specs + mcp_specs
 
     tool_calls: list[dict] = []
     # within-turn dedup: identical read-only calls (re-reading the same file,
@@ -386,7 +277,10 @@ async def agent_reply(cid_or_tid: str, role: str, *, is_channel: bool = False) -
             if name in _CACHEABLE_TOOLS and ck in seen_calls:
                 stub = (f"（重复调用：你已经用相同参数执行过 {label or name}，"
                         "为省 token 未再执行。请基于已获得的信息推进，不要用相同参数重复调用。）")
-                tool_calls.append({"tool": name, "text": label, "result": stub})
+                rec = {"tool": name, "text": label, "result": stub}
+                _flush_text()  # keep the timeline ordered: text-so-far, then this call
+                tool_calls.append(rec)
+                steps.append({"type": "tool", **rec})
                 return stub
 
             if is_mcp:
@@ -402,6 +296,19 @@ async def agent_reply(cid_or_tid: str, role: str, *, is_channel: bool = False) -
                 result = await explorer.explore(
                     args.get("question", ""), ctx, project_ids,
                     role=role, on_subtool=_sub_emit)
+            elif name == "create_project":
+                # provision a real writable project and bind it to this channel,
+                # so the very next agent turn can write_file into it.
+                pj = await asyncio.to_thread(
+                    projects.create_local_project,
+                    args.get("name", ""), args.get("description", "") or "")
+                if is_channel and pj:
+                    channels.add_project_to_channel(cid_or_tid, pj["id"])
+                result = (
+                    f"已创建项目「{pj['name']}」(id={pj['id']})，git 工作区已初始化并绑定到当前群。"
+                    "现在这个群里就有可写仓库了——请立刻用 write_file 把项目骨架逐个文件落地"
+                    "（或 @developer 来落地），不要只给方案文本。"
+                    if pj else "（项目创建失败）")
             else:
                 # built-in tools are blocking (subprocess/fs) — run off the loop
                 result = await asyncio.to_thread(tools.execute, name, args, ctx)
@@ -412,13 +319,15 @@ async def agent_reply(cid_or_tid: str, role: str, *, is_channel: bool = False) -
             elif name in _MUTATING_TOOLS:
                 seen_calls.clear()
             rec = {"tool": name, "text": label, "result": result[:1500]}
+            _flush_text()  # flush the narration that preceded this call, then the call
             tool_calls.append(rec)
+            steps.append({"type": "tool", **rec})
             # persist incrementally so a long turn survives a reload
             db.execute(
                 f"UPDATE {table} SET payload=? WHERE id=?",
                 (db.dumps({"kind": "agent", "html": "".join(acc),
                            "message_id": mid, "streaming": True,
-                           "toolCalls": tool_calls}), mid))
+                           "toolCalls": tool_calls, "steps": steps}), mid))
             db.audit("tool", ticket_id=cid_or_tid, actor=role,
                      detail={"tool": name, "args": label})
             return result
@@ -427,10 +336,13 @@ async def agent_reply(cid_or_tid: str, role: str, *, is_channel: bool = False) -
                                  tools=(tool_specs or None), on_tool=on_tool,
                                  max_tokens=LLM_ANSWER_MAX_TOKENS)
     full = _sanitize_answer(res.get("text") or "".join(acc))
+    _flush_text()  # capture the final answer text as the trailing timeline step
 
     payload = {"kind": "agent", "html": full, "message_id": mid}
     if tool_calls:
         payload["toolCalls"] = tool_calls
+    if steps:
+        payload["steps"] = steps
     db.execute(f"UPDATE {table} SET payload=? WHERE id=?", (db.dumps(payload), mid))
     events.emit("message", ticket=cid_or_tid, agent=role,
                 payload={**payload, "final": True})
@@ -471,3 +383,48 @@ async def human_turn(cid_or_tid: str, text: str, *, is_channel: bool = False) ->
             if nxt not in seen and nxt not in queue:
                 queue.append(nxt)
         depth += 1
+
+
+# ---- acceptance review (real gates on the real agent clone) -------------
+def _post_channel(cid: str, kind: str, *, role: str | None = None, **payload) -> None:
+    """Persist a channel message and stream it — the channel twin of engine.post."""
+    cur = db.execute(
+        "INSERT INTO channel_messages(channel_id,kind,role,payload,created_at) "
+        "VALUES(?,?,?,?,?)",
+        (cid, kind, role, db.dumps({"kind": kind, **payload}), db.now()))
+    events.emit("message", ticket=cid, agent=role,
+                payload={"kind": kind, "message_id": cur.lastrowid, **payload})
+
+
+async def request_review(cid: str, role: str = "developer") -> None:
+    """Run the real acceptance gates against `role`'s current work in this channel:
+    commit the per-role clone → resolve its checkout → run the gate pipeline on it
+    → post a gate-evidence card back to the channel. This is the manual "申请验收"
+    entry point; auto-triggering after a turn comes later (A2/B)."""
+    ch = channels.get_channel(cid)
+    if not ch:
+        return
+    project_ids = _project_ids(cid, is_channel=True)
+    if not project_ids:
+        _post_channel(cid, "sys", text="该作战群未绑定项目，无法验收。")
+        return
+
+    pid = project_ids[0]
+    sha = await asyncio.to_thread(projects.commit_agent_work, pid, role, "gate: 申请验收")
+    root = await asyncio.to_thread(projects.agent_root, pid, role)
+    if not root:
+        _post_channel(cid, "sys", text=f"「{ROLE_CN.get(role, role)}」暂无可门禁的工作副本。")
+        return
+    db.kv_set(f"head:{cid}", sha or "")
+
+    def _gemit(type, **kw):
+        events.emit(type, ticket=cid, payload=kw.get("payload", {}))
+
+    results = await gates.run_pipeline(cid, str(root), sha or "", _gemit)
+
+    summary = [{"gate": r.gate_id, "status": r.status, "evidence": r.evidence}
+               for r in results]
+    failed = any(r.status == "fail" for r in results)
+    ok = not failed and any(r.status == "pass" for r in results)
+    _post_channel(cid, "card", role=role, card="gate",
+                  title="验收结果", sha=sha or "", ok=ok, results=summary)

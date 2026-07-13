@@ -385,24 +385,25 @@ async def _run_gate_pipeline(tid: str) -> None:
         emit(type, ticket=tid, payload=payload)
         _touch(tid)
 
-    fail_count = db.kv_get(f"gatefail:{tid}", 0)
-    for gid in ids:
-        res = await gates.run_gate(tid, gid, wt, head, _gemit)
-        if res.status == "fail":
-            fail_count += 1
-            db.kv_set(f"gatefail:{tid}", fail_count)
-            post(tid, "agent", role="developer",
-                 html=f"{res.gate_id} 门未通过，按路由回到开发修复。")
-            if fail_count >= MAX_GATE_FAILURES:
-                return _escalate(tid, "coordinator", "gate_stuck",
-                                 f"连续 {fail_count} 次验收门失败，升级给你。")
-            # fix-task back to owner, then re-run (FR-6.6)
-            await _dispatch(tid, res.owner_on_fail if res.owner_on_fail in
-                            {"developer"} else "developer",
-                            instruction=f"修复 {res.gate_id} 门失败的问题。",
-                            done_hint="已修复，重新申请验收。")
-            head = db.kv_get(f"head:{tid}", head)
-            return await _run_gate_pipeline(tid)  # re-run on new HEAD
+    # storage-agnostic driver runs the layered gates + streams events; a hard
+    # `fail` short-circuits it. Ticket-side fail routing (re-dispatch/escalate)
+    # stays here since it's coupled to ticket state.
+    results = await gates.run_pipeline(tid, wt, head, _gemit, enabled=ids)
+    failed = next((r for r in results if r.status == "fail"), None)
+    if failed:
+        fail_count = db.kv_get(f"gatefail:{tid}", 0) + 1
+        db.kv_set(f"gatefail:{tid}", fail_count)
+        post(tid, "agent", role="developer",
+             html=f"{failed.gate_id} 门未通过，按路由回到开发修复。")
+        if fail_count >= MAX_GATE_FAILURES:
+            return _escalate(tid, "coordinator", "gate_stuck",
+                             f"连续 {fail_count} 次验收门失败，升级给你。")
+        # fix-task back to owner, then re-run (FR-6.6)
+        await _dispatch(tid, failed.owner_on_fail if failed.owner_on_fail in
+                        {"developer"} else "developer",
+                        instruction=f"修复 {failed.gate_id} 门失败的问题。",
+                        done_hint="已修复，重新申请验收。")
+        return await _run_gate_pipeline(tid)  # re-run on new HEAD
 
     # all automated gates green -> human gate if a sensitive action is gated
     db.kv_set(f"gatefail:{tid}", 0)

@@ -2,6 +2,7 @@ import { useRef, useEffect, useState, useCallback, type ReactNode } from "react"
 import { useAppState } from "../context";
 import { ROLES, STATE_CN } from "../constants";
 import { esc, mdLite } from "../utils";
+import type { TimelineStep } from "../types";
 import * as api from "../api";
 
 const SCROLL_THRESHOLD = 80;
@@ -160,7 +161,7 @@ export default function ChannelView() {
           />
         ))}
         {Object.entries(streaming).map(([id, s]: [string, any]) => (
-          <StreamingBubble key={id} role={s.role} text={s.text} tools={s.tools} />
+          <StreamingBubble key={id} role={s.role} text={s.text} steps={s.steps} />
         ))}
       </div>
 
@@ -230,9 +231,64 @@ function DeleteMsgBtn({ onDelete }: { onDelete?: () => void }) {
   );
 }
 
+const GATE_CN: Record<string, string> = {
+  quick: "快速检查", test: "测试", policy: "策略检查", human: "人工审批",
+};
+const GATE_STATUS_CN: Record<string, string> = {
+  pass: "通过", fail: "未通过", skip: "跳过", pending: "待定", running: "运行中",
+};
+
+function GateCard({ msg }: { msg: any }) {
+  const results: any[] = msg.results || [];
+  const headline = msg.ok ? "验收通过 ✓" : "验收未通过";
+  return (
+    <div className="sys" style={{ display: "block" }}>
+      <div style={{ fontWeight: 600, marginBottom: 6 }}>
+        {esc(msg.title || "验收结果")} · {headline}
+        {msg.sha && (
+          <span style={{ color: "var(--tx3)", fontFamily: "var(--mono)", fontWeight: 400, marginLeft: 8 }}>
+            @{esc(msg.sha)}
+          </span>
+        )}
+      </div>
+      {results.map((r, i) => (
+        <div key={i} style={{ display: "flex", gap: 8, fontSize: 12, padding: "2px 0", alignItems: "baseline" }}>
+          <span className={`pill ${r.status}`} style={{ minWidth: 52, textAlign: "center" }}>
+            {GATE_STATUS_CN[r.status] || r.status}
+          </span>
+          <span style={{ color: "var(--tx)" }}>{GATE_CN[r.gate] || r.gate}</span>
+          <span style={{ color: "var(--tx3)", fontFamily: "var(--mono)", fontSize: 11 }}>
+            {gateEvidenceLine(r)}
+          </span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function gateEvidenceLine(r: any): string {
+  const e = r.evidence || {};
+  if (r.gate === "test") {
+    if (r.status === "skip") return esc(e.reason || "未运行");
+    const cov = e.coverage === "n/a" || e.coverage == null ? "" : ` · 覆盖率 ${e.coverage}%（下限 ${e.floor}）`;
+    return `${esc(e.runner || "")}${cov}`;
+  }
+  if (r.gate === "policy") {
+    return e.secret_scan === "LEAK" ? `泄露: ${(e.leaked || []).join(", ")}` : "密钥扫描通过";
+  }
+  if (r.gate === "quick") {
+    return (e.errors && e.errors.length) ? `问题: ${e.errors.join(", ")}` : "构建/类型检查通过";
+  }
+  return "";
+}
+
 function MessageBubble({ msg, collapsed, onToggle, onAvatarClick, onDelete }: MessageBubbleProps) {
   if (msg.kind === "sys") {
     return <div className="sys"><span>{esc(msg.text || "")}</span></div>;
+  }
+
+  if (msg.kind === "card" && msg.card === "gate") {
+    return <GateCard msg={msg} />;
   }
 
   if (msg.kind === "human") {
@@ -254,8 +310,25 @@ function MessageBubble({ msg, collapsed, onToggle, onAvatarClick, onDelete }: Me
   if (msg.kind === "agent") {
     const info = ROLES[msg.role as keyof typeof ROLES] || { nm: msg.role, ab: "??" };
     const hasThinking = !!msg.thinking;
-    const toolCount = msg.toolCalls?.length || 0;
-    const stepCount = (hasThinking ? 1 : 0) + toolCount;
+    // Ordered turn timeline. New messages carry msg.steps (narration interleaved
+    // with tool calls); older ones are synthesized from toolCalls + html so the
+    // legacy "all tools, then answer" still renders.
+    const timeline: TimelineStep[] = msg.steps?.length
+      ? msg.steps
+      : [
+          ...((msg.toolCalls || []).map((tc: any) => ({ type: "tool", ...tc })) as TimelineStep[]),
+          ...(msg.html ? [{ type: "text", text: msg.html } as TimelineStep] : []),
+        ];
+    // Final answer = the last non-empty text step; everything before it (the
+    // narration + tool calls, in order) is the collapsible process.
+    let ansIdx = -1;
+    for (let i = timeline.length - 1; i >= 0; i--) {
+      const s = timeline[i];
+      if (s && s.type === "text" && s.text.trim()) { ansIdx = i; break; }
+    }
+    const answer = ansIdx >= 0 ? (timeline[ansIdx] as { text: string }).text : (msg.html || "");
+    const process = timeline.filter((_, i) => i !== ansIdx);
+    const stepCount = (hasThinking ? 1 : 0) + process.length;
     const expandable = stepCount > 0;
 
     return (
@@ -287,12 +360,14 @@ function MessageBubble({ msg, collapsed, onToggle, onAvatarClick, onDelete }: Me
               <DeleteMsgBtn onDelete={onDelete} />
             </span>
           </div>
+          {/* Process in the middle — the model's narration and each tool call,
+              nested in the real order they happened (think → verify), rendered
+              ABOVE the answer so the final conclusion always sits at the bottom. */}
+          {expandable && !collapsed && <AgentTrail msg={msg} steps={process} />}
           <div
             className={`bubble${expandable ? " answer" : ""}`}
-            dangerouslySetInnerHTML={{ __html: mdLite(msg.html || "") }}
+            dangerouslySetInnerHTML={{ __html: mdLite(answer) }}
           />
-          {/* Reasoning + tool-call trail — each sub-step independently expandable */}
-          {expandable && !collapsed && <AgentTrail msg={msg} />}
         </div>
       </div>
     );
@@ -301,10 +376,13 @@ function MessageBubble({ msg, collapsed, onToggle, onAvatarClick, onDelete }: Me
   return null;
 }
 
-/** Vertical activity trail: the model's thinking and each tool call become
- *  their own collapsible row, so the operator opens only what they care about
- *  instead of one wall-of-text box. */
-function AgentTrail({ msg }: { msg: any }) {
+/** Vertical activity trail: the model's narration and each tool call, nested in
+ *  the order they happened. Narration text shows inline (the agent "thinking out
+ *  loud"); tool calls stay collapsible so the operator opens only what they want. */
+function AgentTrail({ msg, steps }: { msg: any; steps?: TimelineStep[] }) {
+  const items: TimelineStep[] = steps
+    ?? ((msg.toolCalls || []).map((tc: any) => ({ type: "tool", ...tc })) as TimelineStep[]);
+  let toolN = 0;
   return (
     <div className="trail">
       {msg.thinking && (
@@ -315,20 +393,29 @@ function AgentTrail({ msg }: { msg: any }) {
           body={<div className="dtl-think">{msg.thinking}</div>}
         />
       )}
-      {msg.toolCalls?.map((tc: any, i: number) => {
-        const ti = toolInfo(tc.tool);
+      {items.map((st, i) => {
+        if (st.type === "text") {
+          if (!st.text.trim()) return null;
+          // intermediate narration between tool calls — the connective reasoning
+          return (
+            <div key={i} className="trail-say"
+              dangerouslySetInnerHTML={{ __html: mdLite(st.text) }} />
+          );
+        }
+        toolN += 1;
+        const ti = toolInfo(st.tool);
         return (
           <TrailItem
             key={i}
             kind="tool"
-            index={i + 1}
+            index={toolN}
             icon={ti.icon}
-            label={ti.label || tc.tool}
-            rawName={ti.label ? tc.tool : undefined}
-            meta={tc.text}
+            label={ti.label || st.tool}
+            rawName={ti.label ? st.tool : undefined}
+            meta={st.text}
             body={
-              tc.result
-                ? <pre className="dtl-out">{tc.result}</pre>
+              st.result
+                ? <pre className="dtl-out">{st.result}</pre>
                 : <div className="dtl-empty">（无返回内容）</div>
             }
           />
@@ -370,8 +457,10 @@ const TOOL_REGISTRY: Record<string, ToolInfo> = {
   list_dir:    { icon: "📂", label: "列目录",   desc: "列出仓库目录内容",       color: "#3a6ea5" },
   read_file:   { icon: "📄", label: "读文件",   desc: "读取仓库中的文件",       color: "#3a6ea5" },
   grep:        { icon: "🔍", label: "搜索",     desc: "全文搜索代码仓库",       color: "#3a6ea5" },
+  find_symbol: { icon: "🧭", label: "符号",     desc: "定位符号的定义与调用点（顺调用链追代码）", color: "#3a6ea5" },
   repo_map:    { icon: "🗺️", label: "仓库地图", desc: "生成仓库结构化地图（目录树+符号+依赖+git）", color: "#3a6ea5" },
   explore:     { icon: "🔭", label: "探查",     desc: "只读子代理横扫仓库调查问题并综合结论", color: "#6a5acd" },
+  create_project: { icon: "🆕", label: "建项目", desc: "创建可写的本地项目工作区并绑定到群", color: "#2e8b57" },
   write_file:  { icon: "✏️", label: "写文件",   desc: "写入或覆盖仓库文件",     color: "#a95f36" },
   run_command: { icon: "▶️", label: "跑命令",   desc: "在仓库目录执行命令",     color: "#a95f36" },
 };
@@ -396,52 +485,50 @@ function toolInfo(name: string): ToolInfo {
   return { ...TOOL_DEFAULT, label: name, desc: "" };
 }
 
-function StreamingBubble({ role, text, tools }: {
-  role?: string; text: string; tools?: { tool: string; text: string }[];
+function StreamingBubble({ role, text, steps }: {
+  role?: string; text: string; steps?: TimelineStep[];
 }) {
   const info = ROLES[role as keyof typeof ROLES] || { nm: role, ab: "??" };
+  // Live ordered timeline: narration and tool calls interleaved as they arrive.
+  // Fall back to a lone text step for older events that only carry `text`.
+  const tl: TimelineStep[] = steps?.length ? steps : text ? [{ type: "text", text }] : [];
+  const last = tl[tl.length - 1];
+  const working = last?.type === "tool";
   return (
     <div className="row enter">
       <div className={`av ${role || ""}`}>{info.ab}</div>
       <div style={{ flex: 1, minWidth: 0 }}>
         <div className="who">
           <b>{info.nm}</b>
-          <span className="t">{tools?.length ? "操作中…" : "思考中…"}</span>
+          <span className="t">{working ? "操作中…" : "思考中…"}</span>
         </div>
-        {/* 工具调用 = 过程区，和「思考」同一套视觉语言，与下方 LLM 回答明确区分 */}
-        {!!tools?.length && (
-          <div className="proc live">
-            <div className="proc-hd">
-              <span className="proc-ic">🔧</span>
-              <span>工具调用 · 真实执行</span>
-              <span className="proc-tag">过程</span>
-            </div>
-            <div className="proc-tools">
-              {tools.map((tc, i) => {
-                const last = i === tools.length - 1;
-                const ti = toolInfo(tc.tool);
+        {tl.length ? (
+          <div className="live-timeline">
+            {tl.map((st, i) => {
+              const isLast = i === tl.length - 1;
+              if (st.type === "text") {
+                if (!st.text) return isLast ? <div key={i} className="bubble answer"><TypingDots /></div> : null;
                 return (
-                  <div key={i} className={`live-tool${last ? " active" : " done"}`} title={ti.label ? `${ti.label} (${tc.tool})` : tc.tool}>
-                    <span className="lt-ic">{ti.icon}</span>
-                    <span className="lt-name">{ti.label || tc.tool}</span>
-                    {tc.text && <span className="lt-arg">{esc(tc.text)}</span>}
-                    {last ? <span className="lt-spin" /> : <span className="lt-ok">✓</span>}
+                  <div key={i} className="bubble answer">
+                    <span className="stream-txt" dangerouslySetInnerHTML={{ __html: mdLite(st.text) }} />
+                    {isLast && <span className="caret" />}
                   </div>
                 );
-              })}
-            </div>
+              }
+              const ti = toolInfo(st.tool);
+              return (
+                <div key={i} className={`live-tool${isLast ? " active" : " done"}`}
+                  title={ti.label ? `${ti.label} (${st.tool})` : st.tool}>
+                  <span className="lt-ic">{ti.icon}</span>
+                  <span className="lt-name">{ti.label || st.tool}</span>
+                  {st.text && <span className="lt-arg">{esc(st.text)}</span>}
+                  {isLast ? <span className="lt-spin" /> : <span className="lt-ok">✓</span>}
+                </div>
+              );
+            })}
           </div>
-        )}
-        {/* LLM 输出 = 回答区。工具执行阶段（有工具、暂无正文）先不显示空气泡 */}
-        {(text || !tools?.length) && (
-          <div className="bubble answer">
-            {text ? (
-              <span className="stream-txt" dangerouslySetInnerHTML={{ __html: mdLite(text) }} />
-            ) : (
-              !tools?.length && <TypingDots />
-            )}
-            {text && <span className="caret" />}
-          </div>
+        ) : (
+          <div className="bubble answer"><TypingDots /></div>
         )}
       </div>
     </div>

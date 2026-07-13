@@ -70,6 +70,16 @@ export function getChannelMessages(id: string): Promise<ChannelMessage[]> {
   return getJSON<ChannelMessage[]>(`/api/channels/${id}/messages`);
 }
 
+export function requestReview(
+  channelId: string,
+  role = "developer"
+): Promise<{ ok: boolean; role: string }> {
+  return postJSON<{ ok: boolean; role: string }>(
+    `/api/channels/${channelId}/review`,
+    { role }
+  );
+}
+
 export function sendChannelMessage(
   channelId: string,
   text: string

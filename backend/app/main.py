@@ -61,6 +61,10 @@ class ChatMsg(BaseModel):
     text: str
 
 
+class ReviewReq(BaseModel):
+    role: str = "developer"
+
+
 class AnswerMsg(BaseModel):
     answer: str
 
@@ -480,6 +484,18 @@ def api_post_message(cid: str, body: ChatMsg):
     channels.post_message(cid, "human", html=body.text)
     events.spawn(chat_mod.human_turn(cid, body.text, is_channel=True))
     return channels.get_channel(cid)
+
+
+@app.post("/api/channels/{cid}/review")
+def api_channel_review(cid: str, body: ReviewReq | None = None):
+    """Kick off a real acceptance-gate run against `role`'s work in this channel.
+    Returns immediately; gate progress + the result card stream over /api/events."""
+    if not channels.get_channel(cid):
+        raise HTTPException(404, "channel not found")
+    from . import chat as chat_mod
+    role = (body.role if body else "developer") or "developer"
+    events.spawn(chat_mod.request_review(cid, role))
+    return {"ok": True, "role": role}
 
 
 @app.delete("/api/channels/{cid}/messages")

@@ -37,6 +37,9 @@ _DANGER = (
 
 _REPO_MAP_MAX_FILES = 200
 _REPO_MAP_TREE_MAX = 300
+# repo_map is an overview, not a source of truth — cap its size so a ~35KB map
+# doesn't get re-sent across every tool-loop iteration. Details come from grep/read.
+_REPO_MAP_MAX_CHARS = 12000
 
 
 # ── tool schema (Anthropic tool-use format) ────────────────────────────────
@@ -112,6 +115,33 @@ def tool_specs(allow: set[str] | None = None) -> list[dict[str, Any]]:
             "input_schema": {
                 "type": "object",
                 "properties": {},
+            },
+        },
+        {
+            "name": "find_symbol",
+            "description": ("定位一个符号（函数/类/变量）的**定义位置**和所有**调用/引用点**，"
+                            "用于顺着调用链一步步追代码（跳转到定义 + 查找调用方）——"
+                            "比 grep 更适合追踪「入口→被调函数→再被调函数」的链路，"
+                            "尤其是异步/队列/序列化这种间接调用。"),
+            "input_schema": {
+                "type": "object",
+                "properties": {"name": {"type": "string",
+                                        "description": "要定位的符号精确名（函数/类/变量名）"}},
+                "required": ["name"],
+            },
+        },
+        {
+            "name": "create_project",
+            "description": ("创建一个全新的本地项目并绑定到当前群：会建好一个**可写的 git 工作区**，"
+                            "之后就能用 write_file 往里真正落地代码。当人类要求「新建/搭建一个项目」"
+                            "而当前群里还没有对应的可写项目时，先调用它，再开始写文件。"),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "项目名称"},
+                    "description": {"type": "string", "description": "一句话说明项目要做什么（可选）"},
+                },
+                "required": ["name"],
             },
         },
         {
@@ -198,6 +228,8 @@ def execute(name: str, args: dict[str, Any], ctx: ToolContext) -> str:
             return _read_file(args.get("path", ""), ctx, _int(args.get("offset")))
         if name == "grep":
             return _grep(args.get("pattern", ""), ctx)
+        if name == "find_symbol":
+            return _find_symbol(args.get("name", ""), ctx)
         if name == "repo_map":
             return _repo_map(ctx)
         if name == "write_file":
@@ -227,6 +259,10 @@ def summarize(name: str, args: dict[str, Any]) -> str:
         return args.get("command", "")
     if name == "repo_map":
         return "生成仓库地图"
+    if name == "find_symbol":
+        return args.get("name", "")
+    if name == "create_project":
+        return args.get("name", "")
     if name == "explore":
         return (args.get("question", "") or "")[:60]
     return ""
@@ -317,6 +353,36 @@ def _grep(pattern: str, ctx: ToolContext) -> str:
     return "\n\n".join(blocks)
 
 
+def _find_symbol(name: str, ctx: ToolContext) -> str:
+    if not (name or "").strip():
+        return "（缺少 name 参数）"
+    if not ctx.roots:
+        return "（无可用项目仓库）"
+    multi = len(ctx.roots) > 1
+    blocks: list[str] = []
+    for pid, root in ctx.roots.items():
+        res = projects.find_symbol_repo(pid, name, max_hits=_GREP_MAX, root=root)
+        head = f"【项目 {pid}】" if multi else ""
+        if not res["defs"] and not res["calls"]:
+            blocks.append(f"{head}未找到符号「{name}」的定义或调用"
+                          f"（已扫描 {res['files_scanned']} 个文件）。可能是外部库、"
+                          f"动态生成，或名字不对。")
+            continue
+        parts = [f"{head}符号「{name}」（扫描 {res['files_scanned']} 个文件）："]
+        if res["defs"]:
+            parts.append(f"● 定义（{len(res['defs'])} 处）：")
+            parts += [f"  {d['file']}:{d['line']}: {d['text']}" for d in res["defs"]]
+        else:
+            parts.append("● 定义：未找到（可能是外部库/属性/动态定义）")
+        if res["calls"]:
+            parts.append(f"● 调用/引用（{len(res['calls'])} 处，顺着这些点往上/下游追）：")
+            parts += [f"  {c['file']}:{c['line']}: {c['text']}" for c in res["calls"]]
+        if res["truncated"]:
+            parts.append("⚠️ 结果已达上限、可能还有更多——按目录缩小或直接 read 定义文件。")
+        blocks.append("\n".join(parts))
+    return "\n\n".join(blocks)
+
+
 def _repo_map(ctx: ToolContext) -> str:
     """Generate a structured codebase map: tree + symbols + entry points + deps + git status."""
     import re, json
@@ -365,7 +431,11 @@ def _repo_map(ctx: ToolContext) -> str:
     git_lines = _git_status(root)
     lines.extend(git_lines)
 
-    return "\n".join(lines)
+    out = "\n".join(lines)
+    if len(out) > _REPO_MAP_MAX_CHARS:
+        out = (out[:_REPO_MAP_MAX_CHARS]
+               + "\n…（仓库地图已截断；用 list_dir 看具体目录、grep 定位符号）")
+    return out
 
 
 # ── repo_map helpers ──────────────────────────────────────────────────────

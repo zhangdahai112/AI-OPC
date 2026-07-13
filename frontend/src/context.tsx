@@ -4,7 +4,7 @@ import {
 } from "react";
 import type {
   Channel, ChannelMessage, ChannelMember, Project,
-  FullConfig, Metrics, LLMStatus, SSEEvent, AgentRole,
+  FullConfig, Metrics, LLMStatus, SSEEvent, AgentRole, TimelineStep,
 } from "./types";
 import * as api from "./api";
 
@@ -19,8 +19,9 @@ export interface AppState {
   config: FullConfig | null;
   metrics: Metrics | null;
   llm: LLMStatus | null;
-  // streaming
-  streaming: Record<number, { role?: AgentRole; text: string; tools?: { tool: string; text: string }[] }>;
+  // streaming — `steps` is the ordered timeline (text/tool interleaved); `text`
+  // and `tools` are kept as flat mirrors for the older split renderer.
+  streaming: Record<number, { role?: AgentRole; text: string; tools?: { tool: string; text: string }[]; steps?: TimelineStep[] }>;
   live: Record<string, { agent: string; text: string; tool?: string }>;
   // private 1:1 chat
   privateChat: { channelId: string; role: AgentRole } | null;
@@ -61,7 +62,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const [config, setConfig] = useState<FullConfig | null>(null);
   const [metrics, setMetrics] = useState<Metrics | null>(null);
   const [llm, setLlm] = useState<LLMStatus | null>(null);
-  const [streaming, setStreaming] = useState<Record<number, { role?: AgentRole; text: string; tools?: { tool: string; text: string }[] }>>({});
+  const [streaming, setStreaming] = useState<Record<number, { role?: AgentRole; text: string; tools?: { tool: string; text: string }[]; steps?: TimelineStep[] }>>({});
   const [live, setLive] = useState<Record<string, { agent: string; text: string; tool?: string }>>({});
   const [privateChat, setPrivateChat] = useState<{ channelId: string; role: AgentRole } | null>(null);
   const [privateChatMessages, setPrivateChatMessages] = useState<ChannelMessage[]>([]);
@@ -140,9 +141,16 @@ export function AppProvider({ children }: { children: ReactNode }) {
     // delta streaming
     if (m.type === "delta" && m.ticket === activeChannelIdRef.current && m.payload?.message_id) {
       const mid = m.payload.message_id;
+      const chunk = m.payload?.text || "";
       setStreaming((prev) => {
         const ex = prev[mid] || { role: m.agent, text: "" };
-        return { ...prev, [mid]: { ...ex, text: ex.text + (m.payload?.text || "") } };
+        // append the chunk onto the trailing text step (or open a new one) so the
+        // timeline keeps narration and tool calls in their real order.
+        const steps = [...(ex.steps || [])];
+        const last = steps[steps.length - 1];
+        if (last && last.type === "text") steps[steps.length - 1] = { type: "text", text: last.text + chunk };
+        else steps.push({ type: "text", text: chunk });
+        return { ...prev, [mid]: { ...ex, text: ex.text + chunk, steps } };
       });
       return;
     }
@@ -150,7 +158,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
     if (m.type === "message" && m.payload?.streaming && m.ticket === activeChannelIdRef.current && m.payload?.message_id) {
       const mid = m.payload.message_id;
       setStreaming((prev) => ({
-        ...prev, [mid]: { role: m.agent, text: "" },
+        ...prev, [mid]: { role: m.agent, text: "", steps: [] },
       }));
       return;
     }
@@ -161,7 +169,14 @@ export function AppProvider({ children }: { children: ReactNode }) {
       const text = m.payload.text || "";
       setStreaming((prev) => {
         const ex = prev[mid] || { role: m.agent, text: "" };
-        return { ...prev, [mid]: { ...ex, tools: [...(ex.tools || []), { tool, text }] } };
+        return {
+          ...prev,
+          [mid]: {
+            ...ex,
+            tools: [...(ex.tools || []), { tool, text }],
+            steps: [...(ex.steps || []), { type: "tool", tool, text }],
+          },
+        };
       });
       return;
     }

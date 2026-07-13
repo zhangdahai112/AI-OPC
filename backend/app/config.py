@@ -80,3 +80,7 @@ DEFAULT_BUDGET = {
 # How fast the mock executor "thinks" (seconds between simulated events).
 # Kept short so the demo console feels live without burning real time.
 SIM_TICK_SEC = float(os.environ.get("WARROOM_SIM_TICK", "1.4"))
+
+# Per-gate hard timeout (seconds). Real test suites / builds are slow, so this is
+# much larger than run_command's 60s; each gate command is capped by it.
+GATE_TIMEOUT = int(os.environ.get("WARROOM_GATE_TIMEOUT", "600"))

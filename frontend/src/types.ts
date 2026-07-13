@@ -44,6 +44,9 @@ export interface ChannelMessage {
   // collapsed detail
   thinking?: string;
   toolCalls?: ToolCall[];
+  // ordered turn timeline: narration text interleaved with tool calls, in the
+  // exact order they happened (think → verify → conclude).
+  steps?: TimelineStep[];
 }
 
 export interface ToolCall {
@@ -51,6 +54,10 @@ export interface ToolCall {
   text: string;
   result?: string;
 }
+
+export type TimelineStep =
+  | { type: "text"; text: string }
+  | { type: "tool"; tool: string; text: string; result?: string };
 
 export interface Channel {
   id: string;

@@ -39,14 +39,19 @@ except Exception:  # pragma: no cover — defensive, skills should always import
 MANIFEST_VERSION = "warroom/v1"
 
 # ── built-in tool sets (least privilege by role) ───────────────────────────
-# "explore" = read-only fan-out investigation sub-agent (safe for every tool role)
-_ALL_TOOLS = ["list_dir", "read_file", "grep", "repo_map", "explore",
-              "write_file", "run_command"]
-_READONLY_TOOLS = ["list_dir", "read_file", "grep", "repo_map", "explore"]
+# "find_symbol" (jump-to-def + find-callers) and "explore" (read-only fan-out
+# sub-agent) are both read-only and safe for every tool role. "create_project"
+# provisions a new writable workspace — a management action, not code-touching.
+_ALL_TOOLS = ["list_dir", "read_file", "grep", "find_symbol", "repo_map",
+              "explore", "create_project", "write_file", "run_command"]
+_READONLY_TOOLS = ["list_dir", "read_file", "grep", "find_symbol", "repo_map",
+                   "explore"]
 
 # developer/tester/devops actually change the repo; the rest are read-only.
+# The coordinator stays out of code, but CAN scaffold a project (create_project)
+# so "帮我建个项目" has a real landing spot before it delegates the build.
 _ROLE_TOOLS: dict[str, list[str]] = {
-    "coordinator": [],           # PM only routes & manages — never touches tools
+    "coordinator": ["create_project"],
     "analyst": _READONLY_TOOLS,
     "developer": _ALL_TOOLS,
     "tester": _ALL_TOOLS,

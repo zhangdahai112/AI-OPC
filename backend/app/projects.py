@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import subprocess
 import threading
+import time
 from pathlib import Path
 
 from . import db
@@ -87,6 +88,40 @@ def clone_repo(pid: str) -> dict:
     return get_project(pid)
 
 
+def create_local_project(name: str, docs: str = "") -> dict:
+    """Create a brand-new **local** project (no remote) with a real, writable,
+    git-initialised workspace — so agents can immediately `write_file` into it and
+    each role can clone its own isolated copy. This is what turns "帮我建个项目"
+    from a wall of text into actual files on disk."""
+    name = (name or "新项目").strip()
+    pid = _next_id()
+    path = WORKSPACES_DIR / pid
+    path.mkdir(parents=True, exist_ok=True)
+    db.execute(
+        "INSERT INTO projects(id,name,repo_url,branch,docs,status,local_path,"
+        "created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
+        (pid, name, "", "main", docs, "ready", str(path), db.now(), db.now()))
+    for role in ROLES:                       # seed per-agent permanent memory
+        mp = _mem_path(pid, role)
+        if not mp.exists():
+            mp.parent.mkdir(parents=True, exist_ok=True)
+            mp.write_text(_default_memory(role, name), encoding="utf-8")
+    try:                                     # init a real repo with one commit
+        _git(str(path), "init", "-b", "main")
+        _git(str(path), "config", "user.name", "warroom")
+        _git(str(path), "config", "user.email", "warroom@local")
+        (path / "README.md").write_text(
+            f"# {name}\n\n{docs or '（项目由 AI 作战群创建）'}\n", encoding="utf-8")
+        _git(str(path), "add", "-A")
+        _git(str(path), "commit", "-m", "chore: scaffold project")
+    except Exception as e:
+        db.execute("UPDATE projects SET clone_log=? WHERE id=?",
+                   (f"git init failed: {e}", pid))
+    db.audit("decision", actor="engine",
+             detail={"local_project_created": pid, "name": name})
+    return get_project(pid)
+
+
 # ---- per-agent independent git repos ------------------------------------
 # Each agent role gets its OWN independent clone (its own .git / history / index),
 # NOT a git worktree and NOT a submodule of the base checkout — agent repos are
@@ -140,15 +175,105 @@ def ensure_agent_repo(pid: str, role: str) -> Path | None:
         return dest if ok else None
 
 
+def commit_agent_work(pid: str, role: str, msg: str = "gate: 申请验收") -> str | None:
+    """Stage & commit whatever the agent has written in its per-role clone so the
+    gates have a durable HEAD/diff to run against. Returns the short HEAD sha
+    (whether this call created a new commit or there was nothing new to commit).
+    Returns None only when the role has no clone to commit in."""
+    root = agent_repo_path(pid, role)
+    if not (root / ".git").exists():
+        repo = ensure_agent_repo(pid, role)
+        if not repo:
+            return None
+        root = repo
+    _git(str(root), "add", "-A")
+    # commit may exit non-zero on "nothing to commit" — that's fine, we still
+    # want the current HEAD sha below.
+    _git(str(root), "commit", "-m", msg)
+    rc, out = _git(str(root), "rev-parse", "--short", "HEAD")
+    return out.strip() if rc == 0 and out.strip() else None
+
+
+# ---- keeping checkouts fresh --------------------------------------------
+# A stale clone is a top cause of wrong answers: the agent analyses old code and
+# confidently reports a feature "doesn't exist" when it was added upstream days
+# ago. So we pull the latest before an investigation — throttled (network) and
+# best-effort (a fetch failure must never crash the turn; stale > down).
+_REFRESH_INTERVAL = 60.0  # seconds: at most one fetch per key per minute
+_FETCH_TIMEOUT = 45       # seconds per git fetch
+_last_refresh: dict[str, float] = {}
+_REFRESH_LOCK = threading.Lock()
+
+
+def _should_refresh(key: str) -> bool:
+    now = time.time()
+    with _REFRESH_LOCK:
+        if now - _last_refresh.get(key, 0.0) < _REFRESH_INTERVAL:
+            return False
+        _last_refresh[key] = now
+    return True
+
+
+def refresh_base(pid: str) -> None:
+    """Fast-forward the base checkout to the latest upstream tip (throttled,
+    best-effort). The base is a read-only seed/grounding source — never holds
+    agent work — so resetting it to the fetched tip is safe and robust against
+    force-pushed / diverged branches."""
+    p = get_project(pid)
+    if not p or not p.get("repo_url"):
+        return
+    base = Path(p["local_path"])
+    if not (base / ".git").exists() or not _should_refresh(f"base:{pid}"):
+        return
+    branch = p.get("branch") or "main"
+    try:
+        rc, _ = _git(str(base), "fetch", "--depth", "30", "origin", branch,
+                     timeout=_FETCH_TIMEOUT)
+        if rc == 0:
+            _git(str(base), "reset", "--hard", "FETCH_HEAD", timeout=60)
+    except Exception:
+        pass  # best-effort — proceed with whatever is on disk
+
+
+def refresh_agent_repo(pid: str, role: str) -> None:
+    """Fast-forward an agent's own clone to the latest upstream (throttled,
+    best-effort) WITHOUT clobbering the agent's uncommitted work: skip if the
+    working tree is dirty, and only ff-merge (so local agent commits never get
+    reset away)."""
+    p = get_project(pid)
+    if not p or not p.get("repo_url"):
+        return
+    dest = agent_repo_path(pid, role)
+    if not (dest / ".git").exists() or not _should_refresh(f"agent:{pid}:{role}"):
+        return
+    branch = p.get("branch") or "main"
+    try:
+        rc, out = _git(str(dest), "status", "--porcelain", timeout=30)
+        if rc != 0 or out.strip():
+            return  # dirty → respect the agent's in-progress (uncommitted) work
+        # Clean tree ⇒ no pending agent work, so hard-sync to the fetched tip.
+        # (merge --ff-only can't connect a big shallow gap; reset is robust.) The
+        # dirty-check above is what preserves isolation for agents mid-edit.
+        rc, _ = _git(str(dest), "fetch", "--depth", "30", "origin", branch,
+                     timeout=_FETCH_TIMEOUT)
+        if rc == 0:
+            _git(str(dest), "reset", "--hard", "FETCH_HEAD", timeout=60)
+    except Exception:
+        pass
+
+
 def agent_root(pid: str, role: str | None = None) -> Path | None:
     """The directory an agent operates in: its own independent per-role clone when
-    the project has a git source, otherwise the shared checkout (or None)."""
+    the project has a git source, otherwise the shared checkout (or None).
+    Opportunistically refreshes to the latest upstream first (throttled)."""
     p = get_project(pid)
     if not p or not p.get("local_path"):
         return None
+    refresh_base(pid)                       # fresh seed for new agent clones + grounding
     if role:
         repo = ensure_agent_repo(pid, role)
         if repo:
+            refresh_agent_repo(pid, role)   # fast-forward the agent's own clone
             return repo
     base = Path(p["local_path"])
     return base if base.exists() else None
@@ -382,3 +507,58 @@ def grep_repo(pid: str, pattern: str, max_hits: int = 40,
             "truncated_hits": truncated_hits,
             "truncated_files": walked >= _GREP_WALK_CAP,
             "regex_ok": regex_ok}
+
+
+def find_symbol_repo(pid: str, name: str, max_hits: int = 60,
+                     root: Path | None = None) -> dict:
+    """Locate a symbol's *definitions* and *call/reference sites* across the repo
+    so an agent can trace call chains (jump-to-definition + find-callers) instead
+    of grepping flat and guessing. Returns {defs, calls, files_scanned, truncated}."""
+    import re
+    empty = {"defs": [], "calls": [], "files_scanned": 0, "truncated": False}
+    if not (name or "").strip():
+        return empty
+    if root is None:
+        p = get_project(pid)
+        if not p:
+            return empty
+        root = Path(p["local_path"])
+    if not root.exists():
+        return empty
+
+    esc = re.escape(name.strip())
+    # strong definition forms across py/ts/js/go/rust/java
+    def_re = re.compile(
+        r"\b(?:async\s+def|def|class|func|type|interface|enum|struct|trait|"
+        r"const|let|var)\s+" + esc + r"\b")
+    # any *use*: direct call NAME(, but also passed-as-callback / imported / referenced
+    # (e.g. run_in_threadpool(fn, ...), asyncio.to_thread(fn, ...)) — the indirect/async
+    # hop is exactly what flat call-matching misses.
+    use_re = re.compile(r"\b" + esc + r"\b")
+
+    defs: list[dict] = []
+    calls: list[dict] = []
+    scanned = walked = 0
+    truncated = False
+    for f in _walk_files(root, max_files=_GREP_WALK_CAP):
+        walked += 1
+        if not _is_searchable(f):
+            continue
+        scanned += 1
+        try:
+            text = f.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        rel = str(f.relative_to(root))
+        for i, line in enumerate(text.splitlines(), 1):
+            if def_re.search(line):
+                defs.append({"file": rel, "line": i, "text": line.strip()[:200]})
+            elif use_re.search(line):
+                calls.append({"file": rel, "line": i, "text": line.strip()[:200]})
+            if len(defs) + len(calls) >= max_hits:
+                truncated = True
+                break
+        if truncated:
+            break
+    return {"defs": defs, "calls": calls, "files_scanned": scanned,
+            "truncated": truncated or walked >= _GREP_WALK_CAP}

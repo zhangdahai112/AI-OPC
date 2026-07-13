@@ -441,7 +441,7 @@ select:focus{outline:none;border-color:var(--agent)}
   background:var(--elev2);padding:1px 8px;border-radius:20px;letter-spacing:.04em}
 .proc-tools{display:flex;flex-direction:column;gap:5px}
 /* answer bubble = 主体回答，用左侧强调条把「回答」和上方 muted 过程区拉开层级 */
-.bubble.answer{border-left:2px solid var(--agent-bg);padding-left:10px;margin-left:-2px}
+.bubble.answer{border-left:2px solid var(--agent-bg);padding-left:10px;margin-left:-2px;margin-top:11px}
 
 /* ── stream empty state ── */
 .stream-empty{max-width:420px;margin:auto;text-align:center;padding:40px 20px;animation:rowIn .4s ease}
@@ -603,6 +603,22 @@ select:focus{outline:none;border-color:var(--agent)}
   white-space:pre-wrap;word-break:break-all;max-height:260px;overflow:auto;margin:0;
   background:var(--ink);border:1px solid var(--line);border-radius:7px;padding:9px 11px}
 .dtl-empty{font-size:12px;color:var(--tx3);font-style:italic;padding:2px 0}
+
+/* intermediate narration between tool calls — the agent "thinking out loud",
+   shown inline in the trail (node on the spine, no collapse) so the process
+   reads as one coherent think→verify→conclude flow */
+.trail-say{position:relative;font-size:12.5px;line-height:1.7;color:var(--tx2);
+  word-break:break-word;padding:1px 2px}
+.trail-say::before{content:"";position:absolute;left:-11px;top:8px;width:6px;height:6px;
+  border-radius:50%;background:var(--agent);box-shadow:0 0 0 2px var(--ink)}
+.trail-say p{margin:0 0 6px}
+.trail-say p:last-child{margin-bottom:0}
+
+/* live streaming timeline — narration bubbles and tool chips interleaved in the
+   order they stream in */
+.live-timeline{display:flex;flex-direction:column;gap:6px;margin:2px 0 4px}
+.live-timeline .live-tool{margin:0}
+.live-timeline .bubble.answer{margin:0}
 
 /* ═══════════════════════════════════════════════════════════════
    MARKETPLACE — dedicated market page (MCP connectors + skills)
