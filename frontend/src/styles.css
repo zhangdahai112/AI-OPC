@@ -620,6 +620,34 @@ select:focus{outline:none;border-color:var(--agent)}
 .live-timeline .live-tool{margin:0}
 .live-timeline .bubble.answer{margin:0}
 
+/* ── auto/manual relay mode toggle (channel header) ── */
+.mode-toggle{display:inline-flex;gap:2px;padding:2px;border-radius:9px;
+  border:1px solid var(--line2);background:var(--ink)}
+.mode-seg{padding:3px 10px;border-radius:7px;font-size:12px;font-weight:600;
+  color:var(--tx3);background:transparent;transition:.12s;white-space:nowrap}
+.mode-seg:hover{color:var(--tx2)}
+.mode-seg.on{color:var(--tx);background:var(--agent-bg);
+  box-shadow:inset 0 0 0 1px var(--agent)}
+
+/* ── manual-mode handoff confirm card ── */
+.confirm-card{border:1px solid var(--accent);border-radius:12px;
+  background:linear-gradient(180deg,var(--accent-bg),var(--panel));
+  padding:12px 14px;margin:6px 0}
+.cc-hd{display:flex;align-items:center;gap:7px;font-size:13px;color:var(--tx)}
+.cc-hd .cc-ic{font-size:15px}
+.cc-hd .cc-tag{margin-left:auto;font-size:10px;font-weight:700;color:var(--accent);
+  border:1px solid var(--accent);border-radius:6px;padding:1px 6px}
+.cc-note{font-size:12.5px;line-height:1.6;color:var(--tx2);margin:8px 0 10px}
+.cc-actions{display:flex;flex-wrap:wrap;gap:7px}
+.cc-btn{padding:6px 13px;border-radius:9px;font-size:12.5px;font-weight:600;
+  border:1px solid var(--line2);background:var(--panel);color:var(--tx);
+  transition:.12s;box-shadow:var(--shadow-sm)}
+.cc-btn:hover{transform:translateY(-1px)}
+.cc-btn.go{border-color:var(--agent);background:var(--agent-bg);color:var(--tx)}
+.cc-btn.all{border-color:var(--accent);color:var(--accent)}
+.cc-btn.none{color:var(--tx3)}
+.cc-done{font-size:12px;color:var(--tx3);font-style:italic}
+
 /* ═══════════════════════════════════════════════════════════════
    MARKETPLACE — dedicated market page (MCP connectors + skills)
    ═══════════════════════════════════════════════════════════════ */
@@ -650,3 +678,39 @@ select:focus{outline:none;border-color:var(--agent)}
 .pick-chip{font-size:12px;padding:4px 11px;border-radius:20px;background:var(--ink);
   border:1px dashed var(--line2);color:var(--tx2);transition:.13s}
 .pick-chip:hover{border-style:solid;border-color:var(--agent);color:var(--agent);background:var(--agent-bg)}
+
+/* ═══ Agent workspace drawer — browse the code each role actually wrote ═══ */
+.ws-overlay{position:absolute;inset:0;z-index:40;background:rgba(40,36,28,.28);
+  display:flex;justify-content:flex-end;animation:wsfade .12s ease}
+@keyframes wsfade{from{opacity:0}to{opacity:1}}
+.ws-drawer{width:min(760px,88%);height:100%;background:var(--ink);
+  border-left:1px solid var(--line2);box-shadow:var(--shadow-md);
+  display:flex;flex-direction:column;animation:wsslide .16s ease}
+@keyframes wsslide{from{transform:translateX(24px)}to{transform:translateX(0)}}
+.ws-hd{display:flex;align-items:center;gap:8px;padding:12px 16px;
+  border-bottom:1px solid var(--line);background:var(--panel)}
+.ws-hd b{font-size:14px}
+.ws-x{margin-left:auto;border:none;background:none;cursor:pointer;
+  color:var(--tx3);font-size:15px;padding:2px 6px;border-radius:6px}
+.ws-x:hover{background:var(--elev);color:var(--tx)}
+.ws-pick{display:flex;align-items:center;gap:8px;padding:8px 16px;
+  border-bottom:1px solid var(--line);flex-wrap:wrap}
+.ws-pick select{font-size:12px;padding:4px 8px;border:1px solid var(--line2);
+  border-radius:7px;background:var(--ink);color:var(--tx)}
+.ws-meta{display:flex;align-items:center;gap:6px;font-size:11px;color:var(--tx3);margin-left:auto}
+.ws-meta code{font-family:var(--mono);background:var(--elev);padding:1px 6px;border-radius:5px}
+.ws-dirty{color:var(--warn)}
+.ws-body{flex:1;display:flex;min-height:0}
+.ws-tree{width:38%;min-width:200px;overflow:auto;border-right:1px solid var(--line);
+  padding:6px;display:flex;flex-direction:column;gap:1px}
+.ws-file{text-align:left;border:none;background:none;cursor:pointer;
+  font-family:var(--mono);font-size:12px;color:var(--tx2);padding:4px 8px;
+  border-radius:6px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.ws-file:hover{background:var(--elev)}
+.ws-file.on{background:var(--agent-bg);color:var(--agent)}
+.ws-view{flex:1;overflow:auto;display:flex;flex-direction:column;min-width:0}
+.ws-view-hd{padding:8px 14px;border-bottom:1px solid var(--line);
+  font-family:var(--mono);font-size:12px;color:var(--tx2);background:var(--panel)}
+.ws-code{margin:0;padding:12px 14px;font-family:var(--mono);font-size:12px;
+  line-height:1.55;color:var(--tx);white-space:pre;overflow:auto;flex:1}
+.ws-empty{padding:16px;color:var(--tx3);font-size:12px;line-height:1.6}

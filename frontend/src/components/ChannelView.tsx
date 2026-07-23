@@ -17,6 +17,7 @@ export default function ChannelView() {
   const [text, setText] = useState("");
   const [sending, setSending] = useState(false);
   const [hasNew, setHasNew] = useState(false);
+  const [wsOpen, setWsOpen] = useState(false);
   const isNearBottomRef = useRef(true);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
@@ -116,6 +117,29 @@ export default function ChannelView() {
     textareaRef.current?.focus();
   };
 
+  const mode: "auto" | "manual" = ch.mode || "auto";
+  const handleSetMode = async (next: "auto" | "manual") => {
+    if (mode === next) return;
+    try {
+      await api.setChannelMode(ch.id, next);
+      refreshActiveChannel();
+      toast(next === "manual"
+        ? "已切到手动模式：触发下一个成员需你确认"
+        : "已切到自动模式：成员之间可自行接力");
+    } catch {
+      toast("切换失败");
+    }
+  };
+
+  const handleConfirm = async (choice: string) => {
+    try {
+      await api.confirmHandoff(ch.id, choice);
+      refreshActiveChannel();
+    } catch {
+      toast("操作失败");
+    }
+  };
+
   return (
     <>
       {/* Channel header */}
@@ -126,6 +150,19 @@ export default function ChannelView() {
             <span className="bdot" />
             {ch.status === "active" ? "活跃" : "已结束"}
           </span>
+          <div className="mode-toggle" role="group"
+            title="自动：成员之间可自行接力协作；手动：每次触发下一个成员都要你点选确认">
+            <button className={`mode-seg${mode === "auto" ? " on" : ""}`}
+              onClick={() => handleSetMode("auto")}>⚡ 自动</button>
+            <button className={`mode-seg${mode === "manual" ? " on" : ""}`}
+              onClick={() => handleSetMode("manual")}>✋ 手动</button>
+          </div>
+          {!!(ch.projects || []).length && (
+            <button className="chead-clear" onClick={() => setWsOpen(true)}
+              title="查看各成员写出的代码（每个角色有独立工作副本）">
+              📁 工作区
+            </button>
+          )}
           {!!(ch.messages || []).length && (
             <button className="chead-clear" onClick={handleClear}
               title="清空本群所有消息">
@@ -158,6 +195,7 @@ export default function ChannelView() {
               if (msg.role) openPrivateChat(ch.id, msg.role);
             }}
             onDelete={msg.id ? () => handleDeleteMessage(msg.id) : undefined}
+            onConfirm={handleConfirm}
           />
         ))}
         {Object.entries(streaming).map(([id, s]: [string, any]) => (
@@ -207,7 +245,113 @@ export default function ChannelView() {
           {sending ? "发送中…" : "按回车发送，群里成员会看到你的消息并接力协作"}
         </div>
       </div>
+
+      {wsOpen && (
+        <WorkspaceDrawer
+          projects={(ch.projects || []).map((p: any) => p.project_id).filter(Boolean)}
+          members={(ch.members || []).map((m: any) => m.role)}
+          onClose={() => setWsOpen(false)}
+        />
+      )}
     </>
+  );
+}
+
+/** Slide-in panel to browse the code each agent actually wrote. Every role has its
+ *  own isolated working copy (a per-role clone), so we let the operator pick a
+ *  project + role and inspect that clone's files — closing the "代码不在 workspace
+ *  里" gap without touching the isolation model. */
+function WorkspaceDrawer({ projects, members, onClose }: {
+  projects: string[]; members: string[]; onClose: () => void;
+}) {
+  const roleList = members.filter((r) => r !== "reporter");
+  const [pid, setPid] = useState(projects[0] || "");
+  const [role, setRole] = useState(roleList[0] || "developer");
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const [ws, setWs] = useState<any>(null);
+  const [loading, setLoading] = useState(false);
+  const [sel, setSel] = useState<string>("");
+  const [content, setContent] = useState<string>("");
+
+  useEffect(() => {
+    if (!pid || !role) return;
+    let live = true;
+    setLoading(true);
+    setSel("");
+    setContent("");
+    api.getWorkspace(pid, role)
+      .then((w) => { if (live) setWs(w); })
+      .catch(() => { if (live) setWs(null); })
+      .finally(() => { if (live) setLoading(false); });
+    return () => { live = false; };
+  }, [pid, role]);
+
+  const openFile = async (path: string) => {
+    setSel(path);
+    setContent("加载中…");
+    try {
+      const r = await api.getWorkspaceFile(pid, role, path);
+      setContent(r.content);
+    } catch {
+      setContent("（读取失败）");
+    }
+  };
+
+  return (
+    <div className="ws-overlay" onClick={onClose}>
+      <div className="ws-drawer" onClick={(e) => e.stopPropagation()}>
+        <div className="ws-hd">
+          <b>📁 成员工作区</b>
+          <button className="ws-x" onClick={onClose} title="关闭">✕</button>
+        </div>
+        <div className="ws-pick">
+          {projects.length > 1 && (
+            <select value={pid} onChange={(e) => setPid(e.target.value)}>
+              {projects.map((p) => <option key={p} value={p}>{p}</option>)}
+            </select>
+          )}
+          <select value={role} onChange={(e) => setRole(e.target.value)}>
+            {roleList.map((r) => (
+              <option key={r} value={r}>
+                {ROLES[r as keyof typeof ROLES]?.nm || r}
+              </option>
+            ))}
+          </select>
+          {ws?.exists && (
+            <span className="ws-meta">
+              {ws.branch && <code>{ws.branch}</code>}
+              {ws.head && <code>@{ws.head}</code>}
+              {!!ws.dirty?.length && <span className="ws-dirty">● {ws.dirty.length} 未提交</span>}
+            </span>
+          )}
+        </div>
+        <div className="ws-body">
+          <div className="ws-tree">
+            {loading && <div className="ws-empty">加载中…</div>}
+            {!loading && !ws?.exists && (
+              <div className="ws-empty">
+                该角色还没有工作副本——绑定了 git 仓库的项目里，成员第一次动手（读/写代码）后才会生成。
+              </div>
+            )}
+            {!loading && ws?.exists && !ws.files?.length && (
+              <div className="ws-empty">工作副本为空（还没有写入任何文件）。</div>
+            )}
+            {!loading && ws?.files?.map((f: string) => (
+              <button key={f} className={`ws-file${sel === f ? " on" : ""}`}
+                onClick={() => openFile(f)} title={f}>
+                {f}
+              </button>
+            ))}
+            {ws?.truncated && <div className="ws-empty">…（文件过多，已截断）</div>}
+          </div>
+          <div className="ws-view">
+            {sel
+              ? <><div className="ws-view-hd">{sel}</div><pre className="ws-code">{content}</pre></>
+              : <div className="ws-empty">← 选一个文件查看内容</div>}
+          </div>
+        </div>
+      </div>
+    </div>
   );
 }
 
@@ -217,6 +361,7 @@ interface MessageBubbleProps {
   onToggle: () => void;
   onAvatarClick: () => void;
   onDelete?: () => void;
+  onConfirm?: (choice: string) => void;
 }
 
 function DeleteMsgBtn({ onDelete }: { onDelete?: () => void }) {
@@ -282,7 +427,50 @@ function gateEvidenceLine(r: any): string {
   return "";
 }
 
-function MessageBubble({ msg, collapsed, onToggle, onAvatarClick, onDelete }: MessageBubbleProps) {
+/** Manual-mode handoff gate: an agent wants to trigger the next agent(s); the
+ *  human picks who (if anyone) proceeds. Nothing runs until a choice is made. */
+function ConfirmCard({ msg, onConfirm }: { msg: any; onConfirm?: (c: string) => void }) {
+  const opts: { role: string; name: string }[] = msg.options || [];
+  const done: string | undefined = msg.done;
+  const doneLabel = (c: string) =>
+    c === "none" ? "不触发" : c === "all" ? "全部执行"
+      : (ROLES[c as keyof typeof ROLES]?.nm || c);
+  return (
+    <div className="confirm-card">
+      <div className="cc-hd">
+        <span className="cc-ic">✋</span>
+        <b>需要你确认</b>
+        <span className="cc-tag">手动模式</span>
+      </div>
+      <div className="cc-note">{esc(msg.note || "是否触发下一个成员？")}</div>
+      {done ? (
+        <div className="cc-done">已选择：{doneLabel(done)}</div>
+      ) : (
+        <div className="cc-actions">
+          {opts.map((o) => {
+            const info = ROLES[o.role as keyof typeof ROLES] || { nm: o.name || o.role };
+            return (
+              <button key={o.role} className={`cc-btn go ${o.role}`}
+                onClick={() => onConfirm?.(o.role)}>
+                让 {o.name || info.nm} 接力
+              </button>
+            );
+          })}
+          {opts.length > 1 && (
+            <button className="cc-btn all" onClick={() => onConfirm?.("all")}>
+              全部执行
+            </button>
+          )}
+          <button className="cc-btn none" onClick={() => onConfirm?.("none")}>
+            不用了
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function MessageBubble({ msg, collapsed, onToggle, onAvatarClick, onDelete, onConfirm }: MessageBubbleProps) {
   if (msg.kind === "sys") {
     return <div className="sys"><span>{esc(msg.text || "")}</span></div>;
   }
@@ -291,11 +479,15 @@ function MessageBubble({ msg, collapsed, onToggle, onAvatarClick, onDelete }: Me
     return <GateCard msg={msg} />;
   }
 
+  if (msg.kind === "card" && msg.card === "confirm") {
+    return <ConfirmCard msg={msg} onConfirm={onConfirm} />;
+  }
+
   if (msg.kind === "human") {
     return (
       <div className="row human enter">
         <div className="av">你</div>
-        <div style={{ flex: 1 }}>
+        <div style={{ flex: 1, minWidth: 0 }}>
           <div className="who">
             <b>你</b>
             <span className="t">{msg.t || "刚刚"}</span>
@@ -341,7 +533,7 @@ function MessageBubble({ msg, collapsed, onToggle, onAvatarClick, onDelete }: Me
         >
           {info.ab}
         </div>
-        <div style={{ flex: 1 }}>
+        <div style={{ flex: 1, minWidth: 0 }}>
           <div className="who">
             <b>{info.nm}</b>
             <span className="t">{msg.t || ""}</span>

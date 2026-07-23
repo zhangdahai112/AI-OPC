@@ -12,7 +12,7 @@ export type RosterState =
 export type PipelineState = "pending" | "running" | "pass" | "fail";
 export type CardKind =
   | "contract" | "handoff" | "gate" | "gate-running"
-  | "approval" | "escalation" | "closed" | "done";
+  | "approval" | "escalation" | "closed" | "done" | "confirm";
 export type MessageKind = "sys" | "agent" | "human" | "card";
 export type ChannelStatus = "idle" | "active" | "done";
 
@@ -37,10 +37,13 @@ export interface ChannelMessage {
   done?: string;
   card?: CardKind;
   from?: AgentRole;
+  from_role?: AgentRole;
   to?: AgentRole;
   pt?: string;
   note?: string;
   q?: string;
+  // confirm card (manual-mode handoff gate)
+  options?: { role: AgentRole; name: string }[];
   // collapsed detail
   thinking?: string;
   toolCalls?: ToolCall[];
@@ -63,6 +66,7 @@ export interface Channel {
   id: string;
   name: string;
   status: ChannelStatus;
+  mode?: "auto" | "manual";
   projects: ChannelProject[];
   members: ChannelMember[];
   messages: ChannelMessage[];
@@ -81,6 +85,19 @@ export interface Project {
   local_path: string;
   memory?: Record<AgentRole, string>;
   clone_log?: string;
+}
+
+/** An agent's own working copy (per-role clone) — what code that role produced. */
+export interface Workspace {
+  pid: string;
+  role: string;
+  exists: boolean;
+  root: string;
+  branch: string;
+  head: string;
+  dirty: string[];
+  files: string[];
+  truncated: boolean;
 }
 
 /* ── Legacy ticket types (for migration compat) ── */

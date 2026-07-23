@@ -2,7 +2,7 @@ import type {
   Channel, ChannelMessage, Project, FullConfig, Metrics, LLMStatus,
   LLMProviderStatus, MemoryEntry, AgentRole, Skill, SkillGenResult,
   AgentManifest, Connection, StoreSkill, InstalledSkill,
-  MarketCard, InstalledCatalog,
+  MarketCard, InstalledCatalog, Workspace,
 } from "./types";
 
 /* ─── Base HTTP helpers ─── */
@@ -57,9 +57,28 @@ export function createChannel(payload: {
 
 export function updateChannel(
   id: string,
-  payload: { name?: string; status?: string }
+  payload: { name?: string; status?: string; mode?: "auto" | "manual" }
 ): Promise<Channel> {
   return putJSON<Channel>(`/api/channels/${id}`, payload);
+}
+
+export function setChannelMode(
+  id: string,
+  mode: "auto" | "manual"
+): Promise<Channel> {
+  return putJSON<Channel>(`/api/channels/${id}`, { mode });
+}
+
+/** Manual-mode: answer a pending handoff confirm card. `choice` is a role key to
+ *  run, "all" to run every pending option, or "none" to stop the chain. */
+export function confirmHandoff(
+  id: string,
+  choice: string
+): Promise<{ ok: boolean; choice: string }> {
+  return postJSON<{ ok: boolean; choice: string }>(
+    `/api/channels/${id}/confirm`,
+    { choice }
+  );
 }
 
 export function deleteChannel(id: string): Promise<{ ok: boolean }> {
@@ -176,6 +195,14 @@ export function setAgentMemory(
 }
 export function getProjectChannels(projectId: string): Promise<Channel[]> {
   return getJSON<Channel[]>(`/api/projects/${projectId}/channels`);
+}
+export function getWorkspace(projectId: string, role: string): Promise<Workspace> {
+  return getJSON<Workspace>(`/api/projects/${projectId}/workspace/${role}`);
+}
+export function getWorkspaceFile(
+  projectId: string, role: string, path: string
+): Promise<{ path: string; content: string }> {
+  return getJSON(`/api/projects/${projectId}/workspace/${role}/file?path=${encodeURIComponent(path)}`);
 }
 
 /* ─── Agent Manifests (Agent Studio) ── */

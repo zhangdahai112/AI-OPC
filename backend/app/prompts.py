@@ -145,6 +145,30 @@ BUILD_DISCIPLINE = (
     "`文件:行号`，不要整文件回贴。")
 
 
+# Engineering craft — for agents that actually change code. Distilled from how a
+# strong coding agent works: fit the codebase, reuse what's there, keep the diff
+# minimal, and don't re-verify what the tools already guaranteed.
+CRAFT_DISCIPLINE = (
+    "【工程手艺 — 让改动像原作者写的】\n"
+    "① 融入代码库：先看相邻代码与 CLAUDE.md/README，跟随既有命名、结构、注释密度与惯用法，"
+    "别自带一套风格另起炉灶；\n"
+    "② 复用优先：用项目里已有的工具函数/库/模式，别造轮子；加新依赖前先确认仓库没有现成的；\n"
+    "③ 最小改动：只做被要求的事，别顺手大重构、改无关代码或加没人要的功能——"
+    "改动越小越可审、越可回滚；\n"
+    "④ 别做无用功：刚 write_file 写过的文件不必再读一遍去「确认」（写失败工具会报错）；"
+    "已经查清的事实不要反复重查。")
+
+# Intellectual honesty — say what actually happened. The single most important
+# trust rule for an autonomous agent; applies to anyone who runs tools.
+FAITHFUL_DELIVERY = (
+    "【如实交付 — 别夸大、别糊弄】\n"
+    "- 说「完成 / 通过」之前必须真的验证过（跑了测试或命令、看了结果）；没验证就标「待确认」，"
+    "别拿「应该能跑」当结论；\n"
+    "- 测试失败、命令报错，如实贴关键输出，不掩盖、不粉饰；某步跳过了就明说跳过；\n"
+    "- 发现实际情况与需求或别人的转述矛盾，第一时间指出来，而不是顺着错误往下做；\n"
+    "- 已验证的结论就直接讲，不用反复「我觉得可能大概」地对冲。")
+
+
 # Per-role investigation lens: shared mechanics are role-agnostic; only *what*
 # each role investigates for differs. Override via manifest["prompt"]["investigationLens"].
 ROLE_INVESTIGATION_LENS: dict[str, str] = {
@@ -314,6 +338,16 @@ def _s_build(ctx: PromptContext) -> str | None:
     return BUILD_DISCIPLINE if "write_file" in ctx.tools else None
 
 
+def _s_craft(ctx: PromptContext) -> str | None:
+    """Code-changing agents: fit the codebase, reuse, keep the diff minimal."""
+    return CRAFT_DISCIPLINE if "write_file" in ctx.tools else None
+
+
+def _s_faithful(ctx: PromptContext) -> str | None:
+    """Anyone who runs tools must report what actually happened, not what they hope."""
+    return FAITHFUL_DELIVERY if ctx.has_tools else None
+
+
 def _s_guardrails(ctx: PromptContext) -> str | None:
     gr = _cfg(ctx, "guardrails") or []
     if not gr:
@@ -400,11 +434,13 @@ SECTIONS: list[Section] = [
     Section("guardrails", _s_guardrails),
     Section("harness", _s_harness),
     Section("build", _s_build),
+    Section("craft", _s_craft),
     Section("skills", _s_skills),
     Section("projects", _s_projects),
     Section("members", _s_members),
     Section("collaboration", _s_collaboration),
     Section("output", _s_output),
+    Section("faithful", _s_faithful),
     Section("deanchoring", _s_deanchoring),
     Section("methodology", _s_methodology),
     Section("lens", _s_lens),

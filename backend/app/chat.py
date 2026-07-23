@@ -346,6 +346,19 @@ async def agent_reply(cid_or_tid: str, role: str, *, is_channel: bool = False) -
     db.execute(f"UPDATE {table} SET payload=? WHERE id=?", (db.dumps(payload), mid))
     events.emit("message", ticket=cid_or_tid, agent=role,
                 payload={**payload, "final": True})
+
+    # Durability/visibility: if this turn wrote to disk, commit the agent's own
+    # clone so its work has a stable HEAD to browse and gates can diff against it.
+    # Best-effort and off the loop — a commit failure must never fail the turn.
+    if any(tc["tool"] in _MUTATING_TOOLS for tc in tool_calls):
+        for pid in project_ids:
+            try:
+                await asyncio.to_thread(
+                    projects.commit_agent_work, pid, role,
+                    f"agent({role}): {(_sanitize_answer(full)[:60] or '本轮改动')}")
+            except Exception:
+                pass  # stale-but-visible working tree beats a crashed turn
+
     _set_state(cid_or_tid, role, "done", is_channel=is_channel)
     db.audit("tool", ticket_id=cid_or_tid, actor=role,
              detail={"real_reply": True, "tools": len(tool_calls),
@@ -356,33 +369,115 @@ async def agent_reply(cid_or_tid: str, role: str, *, is_channel: bool = False) -
 MAX_HANDOFF_DEPTH = 4  # cap relay chain so it can't loop forever
 
 
+def _relay_mode(cid_or_tid: str, *, is_channel: bool) -> str:
+    """'manual' gates every agent→agent handoff behind a human confirm; 'auto' lets
+    agents relay freely. Manual mode is a channel feature — tickets are always auto."""
+    return channels.get_mode(cid_or_tid) if is_channel else "auto"
+
+
 async def human_turn(cid_or_tid: str, text: str, *, is_channel: bool = False) -> None:
-    """Human posted `text`. Route to an agent (honoring @mentions) and let the
-    reply relay to any agents it @-mentions, forming a collaboration chain."""
+    """Human posted `text`. Route to an agent (honoring @mentions). In auto mode a
+    reply may relay to agents it @-mentions, forming a collaboration chain; in manual
+    mode each such handoff first waits for a human confirm (see :func:`resume_handoff`)."""
     members = _members_of(cid_or_tid, is_channel=is_channel)
 
-    # 1) explicit @mentions in the human message take priority
+    # explicit @mentions in the human message take priority over auto-routing
     mentioned = detect_mentions(text, members)
-    if mentioned:
-        responders = mentioned
-    else:
-        responders = [await pick_responder(cid_or_tid, is_channel=is_channel)]
+    responders = mentioned or [await pick_responder(cid_or_tid, is_channel=is_channel)]
 
-    # 2) each responder replies; if its reply @mentions others, relay to them
-    seen: set[str] = set()
-    queue = list(responders)
-    depth = 0
-    while queue and depth < MAX_HANDOFF_DEPTH:
+    # Relay (auto-handoff to whoever a reply @-mentions) is orchestration. If the
+    # human directly @-mentioned a NON-coordinator agent, respect exactly who they
+    # called: only those reply, nobody chimes in uninvited. @-ing only the
+    # coordinator (or naming no one) keeps the relay chain on.
+    allow_relay = not mentioned or set(mentioned) == {"coordinator"}
+    manual = _relay_mode(cid_or_tid, is_channel=is_channel) == "manual"
+
+    await _relay_walk(cid_or_tid, is_channel=is_channel, members=members,
+                      queue=list(responders), seen=set(),
+                      manual=manual, allow_relay=allow_relay)
+
+
+async def _relay_walk(cid_or_tid: str, *, is_channel: bool, members: list[str],
+                      queue: list[str], seen: set[str], manual: bool,
+                      allow_relay: bool = True) -> None:
+    """Run each queued agent, then collect whoever its reply @-mentions. In auto mode
+    those get appended and run in the same pass; in manual mode the walk stops and
+    posts a confirm card, resumed by the human via :func:`resume_handoff`."""
+    # auto relays are capped to catch runaway loops; manual is human-gated each hop,
+    # and is naturally bounded by the roster (an agent is never run twice).
+    bound = len(members) + 1 if manual else MAX_HANDOFF_DEPTH
+    depth = len(seen)
+    while queue and depth < bound:
         role = queue.pop(0)
         if role in seen or role not in members:
             continue
         seen.add(role)
         reply = await agent_reply(cid_or_tid, role, is_channel=is_channel)
-        # relay: hand off to anyone this agent @mentioned (not already answered)
-        for nxt in detect_mentions(reply, members):
-            if nxt not in seen and nxt not in queue:
-                queue.append(nxt)
         depth += 1
+        if not allow_relay:
+            continue
+        nxts = [r for r in detect_mentions(reply, members)
+                if r not in seen and r not in queue]
+        if not nxts:
+            continue
+        if manual:
+            # gate: don't trigger the next agent(s) until the human approves
+            remaining = [r for r in queue if r not in seen]
+            _request_handoff_confirm(cid_or_tid, from_role=role,
+                                     options=list(dict.fromkeys(nxts + remaining)),
+                                     seen=seen)
+            return
+        queue.extend(nxts)
+
+
+def _request_handoff_confirm(cid_or_tid: str, *, from_role: str,
+                             options: list[str], seen: set[str]) -> None:
+    """Persist the pending handoff and post a confirm card for the human to pick from."""
+    db.kv_set(f"handoff:{cid_or_tid}",
+              {"seen": list(seen), "options": options, "from": from_role})
+    names = "、".join(ROLE_CN.get(r, r) for r in options)
+    from_cn = ROLE_CN.get(from_role, from_role)
+    _post_channel(cid_or_tid, "card", role=from_role, card="confirm",
+                  from_role=from_role,
+                  options=[{"role": r, "name": ROLE_CN.get(r, r)} for r in options],
+                  note=f"「{from_cn}」想请 {names} 接力。手动模式下需你确认后才会触发。")
+
+
+def _resolve_last_confirm(cid: str, choice: str) -> None:
+    """Mark the most recent confirm card as resolved, so the UI stops offering it."""
+    row = db.query_one(
+        "SELECT id,payload FROM channel_messages WHERE channel_id=? AND kind='card' "
+        "ORDER BY id DESC", (cid,))
+    if not row:
+        return
+    payload = db.loads(row["payload"], {})
+    if payload.get("card") == "confirm":
+        payload["done"] = choice
+        db.execute("UPDATE channel_messages SET payload=? WHERE id=?",
+                   (db.dumps(payload), row["id"]))
+
+
+async def resume_handoff(cid: str, choice: str) -> None:
+    """Human answered a manual-mode confirm card. `choice` is a role key (run only
+    that agent), 'all' (run every pending option), or 'none' (stop the chain)."""
+    pending = db.kv_get(f"handoff:{cid}", None)
+    if not pending:
+        return
+    db.execute("DELETE FROM kv WHERE key=?", (f"handoff:{cid}",))
+    _resolve_last_confirm(cid, choice)
+
+    members = _members_of(cid, is_channel=True)
+    seen = set(pending.get("seen", []))
+    options = [o for o in pending.get("options", []) if o in members]
+
+    if choice == "none":
+        _post_channel(cid, "sys", text="你选择不再触发后续成员，本轮到此为止。")
+        return
+
+    run = options if choice == "all" else [choice]
+    queue = [r for r in run if r in members and r not in seen]
+    await _relay_walk(cid, is_channel=True, members=members, queue=queue,
+                      seen=seen, manual=True, allow_relay=True)
 
 
 # ---- acceptance review (real gates on the real agent clone) -------------

@@ -46,6 +46,7 @@ def get_channel(cid: str) -> dict | None:
     if not row:
         return None
     ch = dict(row)
+    ch.setdefault("mode", "auto")
     ch["projects"] = [
         dict(r) for r in db.query(
             "SELECT project_id FROM channel_projects WHERE channel_id=?", (cid,))]
@@ -62,14 +63,26 @@ def list_channels() -> list[dict]:
 
 
 def update_channel(cid: str, name: str | None = None,
-                  status: str | None = None) -> dict:
+                  status: str | None = None, mode: str | None = None) -> dict:
     if name is not None:
         db.execute("UPDATE channels SET name=?, updated_at=? WHERE id=?",
                    (name, db.now(), cid))
     if status is not None:
         db.execute("UPDATE channels SET status=?, updated_at=? WHERE id=?",
                    (status, db.now(), cid))
+    if mode in ("auto", "manual"):
+        db.execute("UPDATE channels SET mode=?, updated_at=? WHERE id=?",
+                   (mode, db.now(), cid))
+        db.audit("decision", actor="human",
+                 detail={"channel_mode": {"channel": cid, "mode": mode}})
     return get_channel(cid)
+
+
+def get_mode(cid: str) -> str:
+    """Relay mode for a channel: 'auto' (agents call each other) or 'manual'
+    (every agent→agent handoff waits for human confirmation)."""
+    row = db.query_one("SELECT mode FROM channels WHERE id=?", (cid,))
+    return (row["mode"] if row and row["mode"] else "auto")
 
 
 def add_project_to_channel(cid: str, project_id: str) -> None:

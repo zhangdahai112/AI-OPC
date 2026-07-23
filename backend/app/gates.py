@@ -22,8 +22,10 @@ fabricates a green.
 from __future__ import annotations
 
 import asyncio
+import importlib.util
 import re
 import subprocess
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -268,7 +270,7 @@ def _quick(scope_id: str, worktree: str, sha: str) -> GateResult:
     if stack["python"]:
         bad = []
         for f in _any_glob(Path(worktree), "*.py", limit=2000):
-            rc, out = _run(f'python -m py_compile "{f}"', worktree, timeout=60)
+            rc, out = _run(f'{_py()} -m py_compile "{f}"', worktree, timeout=60)
             if rc != 0:
                 bad.append(f.name)
         checks["build"] = "ok" if not bad else "fail"
@@ -354,11 +356,30 @@ def _test(scope_id: str, worktree: str, sha: str) -> GateResult:
                       evidence=evidence)
 
 
+def _py() -> str:
+    """The interpreter running the platform (shell-quoted). It carries the gate's
+    own deps — pytest and pytest-cov — whereas a bare ``python`` on PATH resolves
+    to whatever system interpreter comes first and may lack them. Using that bare
+    ``python`` is what turned a green suite into a false "test fail": pytest without
+    the pytest-cov plugin rejects ``--cov`` and exits non-zero before running."""
+    return f'"{sys.executable}"'
+
+
+def _has_pytest_cov() -> bool:
+    """Whether the platform interpreter can honor ``--cov`` (pytest-cov installed).
+    When it can't, we drop coverage instead of letting pytest error out."""
+    try:
+        return importlib.util.find_spec("pytest_cov") is not None
+    except Exception:
+        return False
+
+
 def _test_command(stack: dict) -> tuple[str | None, str]:
     """Pick the versioned test command for the detected stack (anti-cheat: never
     from agent input). Returns (runner_key, command) or (None, '')."""
     if stack["pytest"]:
-        return "pytest", "python -m pytest --cov --cov-report=term-missing -q"
+        cov = " --cov --cov-report=term-missing" if _has_pytest_cov() else ""
+        return "pytest", f"{_py()} -m pytest{cov} -q"
     if stack["node_runner"] == "jest":
         return "jest", "npx --no-install jest --coverage --ci"
     if stack["node_runner"] == "vitest":

@@ -334,9 +334,10 @@ def api_project(pid: str):
 
 @app.post("/api/projects")
 async def api_create_project(body: NewProject):
-    p = projects.create_project(name=body.name, repo_url=body.repo_url,
-                                branch=body.branch, docs=body.docs)
     if body.repo_url:
+        # 有关联仓库 → 创建项目记录 + 后台克隆
+        p = projects.create_project(name=body.name, repo_url=body.repo_url,
+                                    branch=body.branch, docs=body.docs)
         db.execute("UPDATE projects SET status='cloning' WHERE id=?", (p["id"],))
 
         def _clone_and_notify():
@@ -344,6 +345,9 @@ async def api_create_project(body: NewProject):
             events.emit("project_status", payload={"project_id": p["id"], **result})
 
         asyncio.get_running_loop().run_in_executor(None, _clone_and_notify)
+    else:
+        # 无仓库 → 创建本地沙箱（git init 过的目录，agent 可直接写文件）
+        p = projects.create_local_project(name=body.name, docs=body.docs)
     return p
 
 
@@ -379,6 +383,24 @@ def api_set_memory(pid: str, body: AgentMemory):
     if not projects.get_project(pid):
         raise HTTPException(404, "project not found")
     return projects.set_agent_memory(pid, body.role, body.text)
+
+
+# ---- agent workspace browsing (visibility into per-role clones) ---------
+@app.get("/api/projects/{pid}/workspace/{role}")
+def api_workspace(pid: str, role: str):
+    """File tree + git state of ``role``'s own working copy for this project —
+    lets the operator see the code a given agent actually wrote (it lives in a
+    per-role clone, not the base checkout)."""
+    if not projects.get_project(pid):
+        raise HTTPException(404, "project not found")
+    return projects.workspace_tree(pid, role)
+
+
+@app.get("/api/projects/{pid}/workspace/{role}/file")
+def api_workspace_file(pid: str, role: str, path: str):
+    if not projects.get_project(pid):
+        raise HTTPException(404, "project not found")
+    return {"path": path, "content": projects.workspace_file(pid, role, path)}
 
 
 # ---- per-project Agent Manifests (Agent Studio, phase 1) ----------------
@@ -420,6 +442,11 @@ class NewChannel(BaseModel):
 class ChannelUpdate(BaseModel):
     name: str | None = None
     status: str | None = None
+    mode: str | None = None          # auto | manual (relay gating)
+
+
+class ConfirmReq(BaseModel):
+    choice: str                      # role key | "all" | "none"
 
 
 class ChannelMember(BaseModel):
@@ -455,7 +482,8 @@ def api_channel(cid: str):
 
 @app.put("/api/channels/{cid}")
 def api_update_channel(cid: str, body: ChannelUpdate):
-    ch = channels.update_channel(cid, name=body.name, status=body.status)
+    ch = channels.update_channel(cid, name=body.name, status=body.status,
+                                 mode=body.mode)
     if not ch:
         raise HTTPException(404, "channel not found")
     return ch
@@ -484,6 +512,17 @@ def api_post_message(cid: str, body: ChatMsg):
     channels.post_message(cid, "human", html=body.text)
     events.spawn(chat_mod.human_turn(cid, body.text, is_channel=True))
     return channels.get_channel(cid)
+
+
+@app.post("/api/channels/{cid}/confirm")
+def api_channel_confirm(cid: str, body: ConfirmReq):
+    """Manual-mode: human answers a pending handoff confirm card. `choice` is a role
+    key to run, 'all' to run every pending option, or 'none' to stop the chain."""
+    if not channels.get_channel(cid):
+        raise HTTPException(404, "channel not found")
+    from . import chat as chat_mod
+    events.spawn(chat_mod.resume_handoff(cid, body.choice))
+    return {"ok": True, "choice": body.choice}
 
 
 @app.post("/api/channels/{cid}/review")

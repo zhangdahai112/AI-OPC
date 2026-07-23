@@ -428,6 +428,69 @@ def repo_context(pid: str, max_files: int = 80, role: str | None = None) -> str:
     return "\n".join(lines)
 
 
+# ---- browsing an agent's own workspace (visibility) ---------------------
+# Agents write into their per-role independent clone (see ensure_agent_repo), which
+# is NOT the base checkout the operator sees. These helpers surface that clone so a
+# human can actually inspect the code a given role produced — the "代码不在 workspace
+# 里" gap — without changing the isolation model.
+_WS_TREE_MAX = 500      # files listed in a workspace tree
+_WS_FILE_MAX = 60000    # chars returned for a single workspace file
+
+
+def workspace_tree(pid: str, role: str) -> dict:
+    """List the files in ``role``'s own working copy for project ``pid`` plus its
+    git state (branch / HEAD / dirty entries), so the operator can browse exactly
+    what that agent has on disk. Returns ``exists: False`` when the role has no
+    clone yet (it never acted on a git-backed project)."""
+    p = get_project(pid)
+    empty = {"pid": pid, "role": role, "exists": False, "root": "",
+             "branch": "", "head": "", "dirty": [], "files": [], "truncated": False}
+    if not p:
+        return empty
+    root = agent_root(pid, role)
+    if not root or not root.exists():
+        return empty
+    files: list[str] = []
+    for f in _walk_files(root, _WS_TREE_MAX):
+        files.append(str(f.relative_to(root)).replace("\\", "/"))
+    truncated = len(files) >= _WS_TREE_MAX
+    files.sort()
+
+    branch = head = ""
+    dirty: list[str] = []
+    if (root / ".git").exists():
+        rc, out = _git(str(root), "branch", "--show-current", timeout=15)
+        branch = out.strip() if rc == 0 else ""
+        rc, out = _git(str(root), "rev-parse", "--short", "HEAD", timeout=15)
+        head = out.strip() if rc == 0 else ""
+        rc, out = _git(str(root), "status", "--porcelain", timeout=15)
+        if rc == 0 and out.strip():
+            dirty = [l for l in out.strip().splitlines()][:50]
+    return {"pid": pid, "role": role, "exists": True, "root": str(root),
+            "branch": branch, "head": head, "dirty": dirty,
+            "files": files, "truncated": truncated}
+
+
+def workspace_file(pid: str, role: str, rel_path: str,
+                   max_chars: int = _WS_FILE_MAX) -> str:
+    """Read one file from ``role``'s own working copy (path-traversal guarded)."""
+    root = agent_root(pid, role)
+    if not root or not root.exists():
+        return "（该角色暂无工作副本）"
+    target = (root / (rel_path or "")).resolve()
+    if root not in target.parents and target != root:
+        return "（路径越界，拒绝读取）"
+    if not target.is_file():
+        return f"（文件不存在：{rel_path}）"
+    try:
+        text = target.read_text(encoding="utf-8", errors="replace")
+    except OSError as e:
+        return f"（读取失败：{e}）"
+    if len(text) > max_chars:
+        text = text[:max_chars] + "\n…（已截断）"
+    return text
+
+
 def read_file(pid: str, rel_path: str, max_chars: int = 6000) -> str:
     """Read one file from a project's checkout (for agent grounding)."""
     p = get_project(pid)

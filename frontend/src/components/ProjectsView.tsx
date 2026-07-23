@@ -36,7 +36,7 @@ export default function ProjectsView() {
       <div className="cfgwrap">
         <h2>项目</h2>
         <p className="lead">
-          项目 = 代码仓库（git 克隆）+ 需求文档。每个 agent
+          项目是 agent 工作的空间——可以关联任意 Git 仓库，也可以不关联直接创建本地沙箱。每个 agent
           在项目里有<b>永久不变的记忆</b>，会注入它的系统提示词，让回答稳定且贴合本项目。
         </p>
         <div className="secbox">
@@ -157,10 +157,13 @@ function ProjectDetail({
 
 /* ─── New Project Modal ─── */
 
+type CreateMode = "repo" | "sandbox";
+
 function NewProjectModal({ onClose }: { onClose: () => void }) {
   const { toast, refreshProjects } = useAppState();
+  const [mode, setMode] = useState<CreateMode>("sandbox");
 
-  const handleCreate = async () => {
+  const handleCreateFromRepo = async () => {
     const name = (
       document.getElementById("np-name") as HTMLInputElement
     )?.value.trim();
@@ -168,12 +171,17 @@ function NewProjectModal({ onClose }: { onClose: () => void }) {
       toast("请填写项目名");
       return;
     }
+    const repo_url = (
+      document.getElementById("np-url") as HTMLInputElement
+    )?.value.trim();
+    if (!repo_url) {
+      toast("请填写 Git 仓库 URL");
+      return;
+    }
     try {
       const p = await api.createProject({
         name,
-        repo_url: (
-          document.getElementById("np-url") as HTMLInputElement
-        )?.value.trim(),
+        repo_url,
         branch: (
           document.getElementById("np-branch") as HTMLInputElement
         )?.value.trim() || "main",
@@ -183,7 +191,27 @@ function NewProjectModal({ onClose }: { onClose: () => void }) {
       });
       onClose();
       await refreshProjects();
-      toast(p.repo_url ? "项目已创建 · 后台克隆中" : "项目已创建");
+      toast("项目已创建 · 后台克隆中");
+    } catch {
+      toast("创建失败");
+    }
+  };
+
+  const handleCreateSandbox = async () => {
+    const name = (
+      document.getElementById("ns-name") as HTMLInputElement
+    )?.value.trim() || "临时沙箱";
+    try {
+      await api.createProject({
+        name,
+        repo_url: "",
+        docs: (
+          document.getElementById("ns-docs") as HTMLTextAreaElement
+        )?.value.trim() || "",
+      });
+      onClose();
+      await refreshProjects();
+      toast("沙箱项目已创建");
     } catch {
       toast("创建失败");
     }
@@ -194,44 +222,94 @@ function NewProjectModal({ onClose }: { onClose: () => void }) {
       <div className="box">
         <h3>新建项目</h3>
         <p className="lead">
-          项目定义了 agent 工作的世界：代码仓库 + 需求文档。
+          项目是 agent 工作的地方。可以关联一个代码仓库，也可以直接创建一个本地沙箱。
         </p>
-        <div className="field">
-          <label>项目名称</label>
-          <input id="np-name" placeholder="如：导出服务" autoFocus />
-        </div>
-        <div className="field">
-          <label>Git 仓库 URL（可选，留空则先用需求文档）</label>
-          <input
-            id="np-url"
-            placeholder="https://github.com/owner/repo.git"
-          />
-        </div>
-        <div className="field">
-          <label>分支</label>
-          <input id="np-branch" defaultValue="main" />
-        </div>
-        <div className="field">
-          <label>
-            需求文档（可选）
-            <SkillAssist
-              target="docs"
-              onApply={(t) => fillTextarea("np-docs", t)}
-            />
-          </label>
-          <textarea
-            id="np-docs"
-            placeholder="粘贴 PRD / 需求说明…，或用右上角 Skill 一键起草"
-          />
-        </div>
-        <div className="actions">
-          <button className="btn" onClick={onClose}>
-            取消
+
+        {/* ── tabs ── */}
+        <div className="tabs" style={{ marginBottom: 16 }}>
+          <button
+            className={`tab ${mode === "sandbox" ? "on" : ""}`}
+            onClick={() => setMode("sandbox")}
+          >
+            📦 本地沙箱
           </button>
-          <button className="btn primary" onClick={handleCreate}>
-            创建并克隆
+          <button
+            className={`tab ${mode === "repo" ? "on" : ""}`}
+            onClick={() => setMode("repo")}
+          >
+            🔗 关联仓库
           </button>
         </div>
+
+        {/* ── mode: sandbox ── */}
+        {mode === "sandbox" && (
+          <>
+            <div className="field">
+              <label>项目名称（可选，默认为"临时沙箱"）</label>
+              <input id="ns-name" placeholder="如：数据分析实验" autoFocus />
+            </div>
+            <div className="field">
+              <label>
+                需求 / 说明（可选）
+                <SkillAssist
+                  target="docs"
+                  onApply={(t) => fillTextarea("ns-docs", t)}
+                />
+              </label>
+              <textarea
+                id="ns-docs"
+                rows={5}
+                placeholder="项目目标 / 需求描述…（可选，不填直接进入空白工作区）"
+              />
+            </div>
+            <div className="actions">
+              <button className="btn" onClick={onClose}>取消</button>
+              <button className="btn primary" onClick={handleCreateSandbox}>
+                创建沙箱
+              </button>
+            </div>
+          </>
+        )}
+
+        {/* ── mode: repo ── */}
+        {mode === "repo" && (
+          <>
+            <div className="field">
+              <label>项目名称</label>
+              <input id="np-name" placeholder="如：导出服务" autoFocus />
+            </div>
+            <div className="field">
+              <label>Git 仓库 URL</label>
+              <input
+                id="np-url"
+                placeholder="https://github.com/owner/repo.git"
+              />
+            </div>
+            <div className="field">
+              <label>分支</label>
+              <input id="np-branch" defaultValue="main" />
+            </div>
+            <div className="field">
+              <label>
+                需求文档（可选）
+                <SkillAssist
+                  target="docs"
+                  onApply={(t) => fillTextarea("np-docs", t)}
+                />
+              </label>
+              <textarea
+                id="np-docs"
+                placeholder="粘贴 PRD / 需求说明…"
+              />
+            </div>
+            <div className="actions">
+              <button className="btn" onClick={onClose}>取消</button>
+              <button className="btn primary" onClick={handleCreateFromRepo}>
+                创建并克隆
+              </button>
+            </div>
+          </>
+        )}
       </div>
     </div>
   );

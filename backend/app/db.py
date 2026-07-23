@@ -37,6 +37,7 @@ CREATE TABLE IF NOT EXISTS channels (
     id         TEXT PRIMARY KEY,
     name       TEXT NOT NULL,
     status     TEXT NOT NULL DEFAULT 'active',
+    mode       TEXT NOT NULL DEFAULT 'auto',   -- auto | manual (relay gating)
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL
 );
@@ -164,6 +165,9 @@ def init_db() -> None:
         cols = {r[1] for r in c.execute("PRAGMA table_info(tickets)").fetchall()}
         if "project_id" not in cols:
             c.execute("ALTER TABLE tickets ADD COLUMN project_id TEXT DEFAULT ''")
+        ch_cols = {r[1] for r in c.execute("PRAGMA table_info(channels)").fetchall()}
+        if "mode" not in ch_cols:
+            c.execute("ALTER TABLE channels ADD COLUMN mode TEXT NOT NULL DEFAULT 'auto'")
         c.commit()
 
 
