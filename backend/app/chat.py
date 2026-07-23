@@ -349,6 +349,7 @@ async def agent_reply(cid_or_tid: str, role: str, *, is_channel: bool = False) -
 
     # Durability/visibility: if this turn wrote to disk, commit the agent's own
     # clone so its work has a stable HEAD to browse and gates can diff against it.
+    # Also propagate changes back to the base checkout so other roles can see them.
     # Best-effort and off the loop — a commit failure must never fail the turn.
     if any(tc["tool"] in _MUTATING_TOOLS for tc in tool_calls):
         for pid in project_ids:
@@ -356,6 +357,8 @@ async def agent_reply(cid_or_tid: str, role: str, *, is_channel: bool = False) -
                 await asyncio.to_thread(
                     projects.commit_agent_work, pid, role,
                     f"agent({role}): {(_sanitize_answer(full)[:60] or '本轮改动')}")
+                await asyncio.to_thread(
+                    projects.propagate_to_base, pid, role)
             except Exception:
                 pass  # stale-but-visible working tree beats a crashed turn
 
@@ -367,6 +370,7 @@ async def agent_reply(cid_or_tid: str, role: str, *, is_channel: bool = False) -
 
 
 MAX_HANDOFF_DEPTH = 4  # cap relay chain so it can't loop forever
+_MAX_SAME_ROLE_TURNS = 3  # multi-turn: max consecutive turns for the same role
 
 
 def _relay_mode(cid_or_tid: str, *, is_channel: bool) -> str:
@@ -402,14 +406,22 @@ async def _relay_walk(cid_or_tid: str, *, is_channel: bool, members: list[str],
                       allow_relay: bool = True) -> None:
     """Run each queued agent, then collect whoever its reply @-mentions. In auto mode
     those get appended and run in the same pass; in manual mode the walk stops and
-    posts a confirm card, resumed by the human via :func:`resume_handoff`."""
-    # auto relays are capped to catch runaway loops; manual is human-gated each hop,
-    # and is naturally bounded by the roster (an agent is never run twice).
-    bound = len(members) + 1 if manual else MAX_HANDOFF_DEPTH
-    depth = len(seen)
+    posts a confirm card, resumed by the human via :func:`resume_handoff`.
+
+    Supports **multi-turn**: if an agent's reply contains "继续" or "未完" (more work),
+    it is re-queued (up to ``_MAX_SAME_ROLE_TURNS`` per walk). This lets the same
+    agent continue coding across multiple LLM calls when a single turn's token budget
+    isn't enough."""
+    # auto relays are capped to catch runaway loops; manual is human-gated each hop.
+    bound = len(members) * _MAX_SAME_ROLE_TURNS if not manual else len(members) + 1
+    turn_counts: dict[str, int] = {}
+    depth = 0
     while queue and depth < bound:
         role = queue.pop(0)
-        if role in seen or role not in members:
+        if role not in members:
+            continue
+        turn_counts[role] = turn_counts.get(role, 0) + 1
+        if turn_counts[role] > _MAX_SAME_ROLE_TURNS:
             continue
         seen.add(role)
         reply = await agent_reply(cid_or_tid, role, is_channel=is_channel)
@@ -417,7 +429,14 @@ async def _relay_walk(cid_or_tid: str, *, is_channel: bool, members: list[str],
         if not allow_relay:
             continue
         nxts = [r for r in detect_mentions(reply, members)
-                if r not in seen and r not in queue]
+                if r not in queue]
+        # Multi-turn: if agent signals "not done yet", re-queue itself
+        if "继续" in reply or "未完" in reply or "next turn" in reply.lower():
+            if turn_counts.get(role, 0) < _MAX_SAME_ROLE_TURNS:
+                nxts.append(role)
+        for n in nxts:
+            if n not in queue:
+                queue.append(n)
         if not nxts:
             continue
         if manual:

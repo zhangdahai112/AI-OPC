@@ -176,22 +176,82 @@ def ensure_agent_repo(pid: str, role: str) -> Path | None:
 
 
 def commit_agent_work(pid: str, role: str, msg: str = "gate: 申请验收") -> str | None:
-    """Stage & commit whatever the agent has written in its per-role clone so the
-    gates have a durable HEAD/diff to run against. Returns the short HEAD sha
-    (whether this call created a new commit or there was nothing new to commit).
-    Returns None only when the role has no clone to commit in."""
-    root = agent_repo_path(pid, role)
+    """Stage & commit whatever the agent has written. In the shared workspace
+    model (now the default), this commits on the base checkout's current branch
+    (``agent/<role>``). Returns the short HEAD sha, or None if no git repo."""
+    p = get_project(pid)
+    if not p or not p.get("local_path"):
+        return None
+    root = Path(p["local_path"])
     if not (root / ".git").exists():
-        repo = ensure_agent_repo(pid, role)
-        if not repo:
-            return None
-        root = repo
+        return None
+    if role:
+        _git(str(root), "checkout", "-B", f"agent/{role}")
     _git(str(root), "add", "-A")
-    # commit may exit non-zero on "nothing to commit" — that's fine, we still
-    # want the current HEAD sha below.
     _git(str(root), "commit", "-m", msg)
     rc, out = _git(str(root), "rev-parse", "--short", "HEAD")
     return out.strip() if rc == 0 and out.strip() else None
+
+
+def propagate_to_base(pid: str, role: str) -> None:
+    """Copy this agent role's files to the **base checkout** so other roles can
+    see them on their next turn. Each agent writes into its own per-role clone
+    (isolation), but the result must be visible to downstream roles.
+
+    Copies non-git, non-cache files from the agent's clone to base. Best-effort."""
+    import shutil
+    p = get_project(pid)
+    if not p:
+        return
+    base = Path(p["local_path"])
+    src_root = agent_repo_path(pid, role)
+    if not (src_root / ".git").exists():
+        return
+    _SKIP = {".git", "__pycache__", ".pyc", ".pyd", ".pyo", ".db", ".sqlite3"}
+    copied = 0
+    for f in src_root.rglob("*"):
+        if f.is_dir():
+            continue
+        if any(part in _SKIP for part in f.parts):
+            continue
+        if f.suffix in _SKIP:
+            continue
+        rel = f.relative_to(src_root)
+        dst = base / rel
+        if dst.exists() and dst.stat().st_mtime >= f.stat().st_mtime:
+            continue  # already up to date
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(str(f), str(dst))
+        copied += 1
+    if copied:
+        _git(str(base), "add", "-A", timeout=30)
+        _git(str(base), "commit", "-m", f"chore: propagate {role} work ({copied} files)", timeout=30)
+
+
+def sync_agent_from_base(pid: str, role: str) -> None:
+    """Pull the latest base changes into the agent's per-role clone so it can
+    see work done by other roles. Best-effort (clone from scratch if merge fails)."""
+    p = get_project(pid)
+    if not p:
+        return
+    base = Path(p["local_path"])
+    dest = agent_repo_path(pid, role)
+    if not (base / ".git").exists() or not (dest / ".git").exists():
+        return
+    # Fetch from base (treat base as a remote)
+    rc, _ = _git(str(dest), "fetch", str(base), "main", timeout=30)
+    if rc != 0:
+        return
+    # Attempt ff-merge; if that fails, re-clone from base
+    rc2, _ = _git(str(dest), "merge", "--ff-only", "FETCH_HEAD", timeout=30)
+    if rc2 != 0:
+        # Re-clone: delete and recreate from base
+        import shutil
+        try:
+            shutil.rmtree(str(dest))
+        except Exception:
+            pass
+        ensure_agent_repo(pid, role)
 
 
 # ---- keeping checkouts fresh --------------------------------------------
@@ -263,20 +323,28 @@ def refresh_agent_repo(pid: str, role: str) -> None:
 
 
 def agent_root(pid: str, role: str | None = None) -> Path | None:
-    """The directory an agent operates in: its own independent per-role clone when
-    the project has a git source, otherwise the shared checkout (or None).
-    Opportunistically refreshes to the latest upstream first (throttled)."""
+    """The directory an agent operates in: the **shared base checkout** so every
+    role sees the same files. Cross-role visibility is immediate — no propagation
+    needed. Each role can still use a git branch for its own work-in-progress.
+
+    Falls back to the shared checkout when there is no git repo."""
     p = get_project(pid)
     if not p or not p.get("local_path"):
         return None
-    refresh_base(pid)                       # fresh seed for new agent clones + grounding
-    if role:
-        repo = ensure_agent_repo(pid, role)
-        if repo:
-            refresh_agent_repo(pid, role)   # fast-forward the agent's own clone
-            return repo
     base = Path(p["local_path"])
-    return base if base.exists() else None
+    if not base.exists():
+        return None
+    refresh_base(pid)  # pull latest upstream (for remote repos)
+    # Switch to a role-specific branch so isolation is preserved via git,
+    # not via separate working trees. This keeps the files visible to all
+    # while keeping each role's in-progress changes on its own branch.
+    if role and (base / ".git").exists():
+        branch = f"agent/{role}"
+        rc, _ = _git(str(base), "checkout", "-B", branch, timeout=30)
+        if rc != 0:
+            # fallback: create orphan branch
+            _git(str(base), "checkout", "--orphan", branch, timeout=30)
+    return base
 
 
 def get_project(pid: str) -> dict | None:

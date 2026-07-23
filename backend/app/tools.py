@@ -186,14 +186,20 @@ class ToolContext:
 
     @classmethod
     def for_agent(cls, project_ids: list[str], role: str) -> "ToolContext":
-        """Confine tools to each project's per-role independent clone, so this
-        agent's writes/commands are isolated from other agents on the same
-        project. Falls back to the shared checkout when there is no git repo."""
+        """All agents share the **base checkout** (not per-role clones) so every
+        role's writes are immediately visible to the entire team. Cross-role
+        propagation is baked in — no sync needed.
+
+        Git branch isolation is still available per-role, but the working tree
+        is shared. Falls back to the shared checkout when there is no git repo."""
         roots: dict[str, Path] = {}
         for pid in project_ids:
-            root = projects.agent_root(pid, role)
-            if root and root.exists():
-                roots[pid] = root.resolve()
+            p = projects.get_project(pid)
+            if not p or not p.get("local_path"):
+                continue
+            root = Path(p["local_path"]).resolve()
+            if root.exists():
+                roots[pid] = root
         default = next(iter(roots), None)
         return cls(roots=roots, default_pid=default)
 
